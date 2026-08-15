@@ -274,18 +274,35 @@ body[${dataAttr}][data-ds-dark-theme] .titlebar {
 }
 
 function skinJson(name, order) {
+  const display = `${displayName(name)} 皮肤`
+  const dataAttr = `data-dsh-${name}`
   return {
     id: name,
-    name: `${displayName(name)} 皮肤`,
+    name: display,
     nameEn: `${displayName(name)} Skin`,
     author: 'dsh-web-ui',
     tagline: '<编辑：一句话卖点>',
     description: '<编辑：长一点的介绍>',
     tags: [name, 'new'],
     accent: '#6c5ce7',
-    bodyAttr: `data-dsh-${name}`,
+    bodyAttr: dataAttr,
     package: `@deepseek-ai/dsh-client-ui-skin-${name}`,
     wiring: { id: `ui-skin-${name}`, bundleWired: false },
+    // Explicit registration manifest (optional): the preferred display source
+    // for the skin-center card; falls back to the top-level fields above when
+    // omitted. Any field here wins over the same-named top-level field. Use it
+    // to override gallery copy for external / third-party skins without
+    // touching the discovery contract (id/package/wiring).
+    manifest: {
+      name: display,
+      nameEn: `${displayName(name)} Skin`,
+      author: 'dsh-web-ui',
+      tagline: '<编辑：一句话卖点>',
+      description: '<编辑：长一点的介绍>',
+      accent: '#6c5ce7',
+      bodyAttr: dataAttr,
+      package: `@deepseek-ai/dsh-client-ui-skin-${name}`,
+    },
     preview: {
       light: `packages/skins/${name}/preview/light.png`,
       dark: `packages/skins/${name}/preview/dark.png`,

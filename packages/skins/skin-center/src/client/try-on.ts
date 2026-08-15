@@ -105,10 +105,35 @@ function bootEntryIds(): string[] {
   return boot?.entries?.map(entry => entry.id) ?? []
 }
 
-/** The skin package currently ACTIVE in the boot graph, if it is one of ours. */
+/** A skin plugin package id — `@<scope>/dsh-client-ui-skin-<id>`, ANY scope. */
+const SKIN_PACKAGE_ID = /^@[A-Za-z0-9][A-Za-z0-9._-]*\/dsh-client-ui-skin-(?!center)([a-z0-9-]+)$/
+
+/**
+ * The skin package currently ACTIVE in the boot graph, if it is one of ours.
+ * Matches the boot entry id against the prebuilt registry first (known skins
+ * carry gallery metadata), then falls back to a synthesized entry for an
+ * EXTERNAL-scope skin id (`@<scope>/dsh-client-ui-skin-<id>`) so an active
+ * external skin is still detected for try-on retraction / active badge — the
+ * generalized-discovery companion to SkinCenter's runtime registry merge.
+ */
 export function activeSkinEntry(): SkinCenterEntry | undefined {
-  const ids = new Set(bootEntryIds())
-  return SKIN_CENTER_ENTRIES.find(entry => ids.has(entry.package))
+  const ids = bootEntryIds()
+  const prebuilt = SKIN_CENTER_ENTRIES.find(entry => ids.includes(entry.package))
+  if (prebuilt !== undefined) return prebuilt
+  for (const id of ids) {
+    const match = SKIN_PACKAGE_ID.exec(id)
+    if (match === null) continue
+    return {
+      id: match[1],
+      name: match[1],
+      nameEn: match[1],
+      accent: '#6750a4',
+      bodyAttr: '',
+      package: id,
+      order: undefined,
+    }
+  }
+  return undefined
 }
 
 /**

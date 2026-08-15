@@ -56,6 +56,11 @@ src/client/index.ts（最小 apply 模板）、`<name>.module.css`（作用域�
 - 不携带静态资源文件：内联 SVG / data URI（参考 qq98 的企鹅 favicon 写法）。
 - `skin.json` 字段（gallery 与 dsh-skin 的契约）：id（=目录名）、name/nameEn、author、
   tagline、description、tags、accent、bodyAttr、package、wiring、preview 路径、order。
+- 可选 `manifest` 块（显式注册清单，供第三方/外部皮肤使用）：把 gallery 展示字段
+  （name/nameEn/author/tagline/description/accent/bodyAttr/package 等）再包一层。
+  皮肤中心优先读 `manifest`，缺省回退顶层字段。不写 `manifest` 的皮肤也完全可用——
+  仅凭 id/package/wiring 即被泛化发现（任何 npm scope，不只 @linxin666，如
+  @AnNingUI）。
 
 ## 3. 构建与测试
 

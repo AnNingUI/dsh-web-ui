@@ -9,7 +9,7 @@
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readlinkSync, rmSync, existsSync, symlinkSync, lstatSync, realpathSync, chmodSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 
@@ -35,6 +35,9 @@ import {
   activeSkinIsBundleWired,
   resolveSkinsDir,
   findScopedAnchor,
+  findScopedAnchors,
+  isSkinHomeDir,
+  readSkinDisplay,
   listSkinDirCandidates,
   type SkinSwitchEntry,
 } from '../src/skin-switch.ts'
@@ -947,6 +950,151 @@ describe('self-referential symlink defense (issue #43: ELOOP on second skin swit
     expect(readlinkSync(target)).toBe(realDir)
     // And it still resolves (no ELOOP on realpath).
     expect(realpathSync(target)).toBe(realpathSync(realDir))
+  })
+})
+
+describe('generalized skin discovery across any npm scope (issue: external skins)', () => {
+  it('isSkinHomeDir recognizes skin homes in ANY scope, including uppercase scopes', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-scope-home-'))
+    try {
+      // External scope (uppercase like @AnNingUI) carrying a per-skin package.
+      const extPkg = join(fakeRoot, 'node_modules', '@AnNingUI', 'dsh-client-ui-skin-md3-wallpaper')
+      mkdirSync(join(extPkg, 'lib'), { recursive: true })
+      writeFileSync(join(extPkg, 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper',
+        package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper',
+        wiring: { id: 'ui-skin-md3-wallpaper' },
+      }))
+      expect(isSkinHomeDir(join(fakeRoot, 'node_modules', '@AnNingUI'))).toBe(true)
+      // A scope with only a carrier is a home too.
+      const carrierScope = join(fakeRoot, 'node_modules', '@linxin666')
+      mkdirSync(join(carrierScope, 'dsh-skins', 'skins', 'miku', 'lib'), { recursive: true })
+      writeFileSync(join(carrierScope, 'dsh-skins', 'skins', 'miku', 'skin.json'), JSON.stringify({
+        id: 'miku', package: '@linxin666/dsh-client-ui-skin-miku', wiring: { id: 'ui-skin-miku' },
+      }))
+      expect(isSkinHomeDir(carrierScope)).toBe(true)
+      // An empty / plugin-only scope is NOT a home.
+      mkdirSync(join(fakeRoot, 'node_modules', '@deepseek-ai', 'cordis'), { recursive: true })
+      expect(isSkinHomeDir(join(fakeRoot, 'node_modules', '@deepseek-ai'))).toBe(false)
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('findScopedAnchors collects every skin-home scope, ordering @linxin666 first', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-anchors-'))
+    try {
+      const nm = join(fakeRoot, 'node_modules')
+      // @linxin666 home via carrier + @AnNingUI home via per-skin package.
+      const linx = join(nm, '@linxin666')
+      const anni = join(nm, '@AnNingUI')
+      mkdirSync(join(linx, 'dsh-skins', 'skins', 'miku', 'lib'), { recursive: true })
+      writeFileSync(join(linx, 'dsh-skins', 'skins', 'miku', 'skin.json'), JSON.stringify({
+        id: 'miku', package: '@linxin666/dsh-client-ui-skin-miku', wiring: { id: 'ui-skin-miku' },
+      }))
+      mkdirSync(join(anni, 'dsh-client-ui-skin-md3-wallpaper', 'lib'), { recursive: true })
+      writeFileSync(join(anni, 'dsh-client-ui-skin-md3-wallpaper', 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper', package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper', wiring: { id: 'ui-skin-md3-wallpaper' },
+      }))
+      const storePkg = join(nm, '.pnpm', '@AnNingUI+dsh-client-ui-skin-center@0.1.3', 'node_modules', '@AnNingUI', 'dsh-client-ui-skin-center', 'lib')
+      mkdirSync(storePkg, { recursive: true })
+      const anchors = findScopedAnchors(storePkg)
+      // Both scopes are discovered; @linxin666 sorts before @AnNingUI.
+      expect(anchors.map(a => basename(a))).toEqual(['@linxin666', '@AnNingUI'])
+      // The legacy single-root accessor still returns @linxin666 first.
+      expect(basename(findScopedAnchor(storePkg) as string)).toBe('@linxin666')
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('loadRegistry discovers EXTERNAL-scope skins when passed an external scoped root', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-registry-ext-'))
+    try {
+      // @AnNingUI home with md3-wallpaper as a direct package (external scope).
+      const anni = join(fakeRoot, 'node_modules', '@AnNingUI')
+      mkdirSync(join(anni, 'dsh-client-ui-skin-md3-wallpaper', 'lib'), { recursive: true })
+      writeFileSync(join(anni, 'dsh-client-ui-skin-md3-wallpaper', 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper', package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper', wiring: { id: 'ui-skin-md3-wallpaper' },
+      }))
+      const registry = loadRegistry(anni)
+      expect(registry['md3-wallpaper']).toBeDefined()
+      expect(registry['md3-wallpaper'].pkg).toBe('@AnNingUI/dsh-client-ui-skin-md3-wallpaper')
+      expect(registry['md3-wallpaper'].id).toBe('ui-skin-md3-wallpaper')
+      // A scoped root that does NOT contain the external skin must not see it:
+      // discovery is scoped to the roots actually scanned.
+      expect(loadRegistry(join(fakeRoot, 'node_modules', '@deepseek-ai'))).not.toHaveProperty('md3-wallpaper')
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts UPPERCASE-scoped package names in skin.json (npm allows case-preserved scopes)', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-npmpkg-case-'))
+    try {
+      const scoped = join(fakeRoot, '@AnNingUI')
+      mkdirSync(join(scoped, 'dsh-client-ui-skin-md3-wallpaper', 'lib'), { recursive: true })
+      writeFileSync(join(scoped, 'dsh-client-ui-skin-md3-wallpaper', 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper', package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper', wiring: { id: 'ui-skin-md3-wallpaper' },
+      }))
+      const registry = loadRegistry(scoped)
+      expect(registry['md3-wallpaper'].pkg).toBe('@AnNingUI/dsh-client-ui-skin-md3-wallpaper')
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('skin display metadata from skin.json manifest block (explicit registration)', () => {
+  it('reads a skin.json that ONLY carries shape fields (no manifest): top-level fallback', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-display-fallback-'))
+    try {
+      const pkg = join(fakeRoot, 'md3-wallpaper')
+      mkdirSync(pkg, { recursive: true })
+      writeFileSync(join(pkg, 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper',
+        name: '材质你在壁纸',
+        nameEn: 'Material You Wallpaper',
+        tagline: '壁纸取色',
+        accent: '#6750a4',
+        bodyAttr: 'data-dsh-md3-wallpaper',
+        package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper',
+      }))
+      const display = readSkinDisplay(pkg)
+      expect(display).not.toBeNull()
+      expect(display?.id).toBe('md3-wallpaper')
+      expect(display?.name).toBe('材质你在壁纸')
+      expect(display?.accent).toBe('#6750a4')
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers an explicit `manifest` block over the top-level fields', () => {
+    const fakeRoot = mkdtempSync(join(tmpdir(), 'skin-display-manifest-'))
+    try {
+      const pkg = join(fakeRoot, 'md3-wallpaper')
+      mkdirSync(pkg, { recursive: true })
+      writeFileSync(join(pkg, 'skin.json'), JSON.stringify({
+        id: 'md3-wallpaper',
+        name: 'TOP_LEVEL_NAME',
+        package: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper',
+        manifest: {
+          name: 'MANIFEST_NAME',
+          nameEn: 'Manifest English',
+          author: 'AnNingUI',
+          tagline: 'manifest tagline',
+          accent: '#ff0000',
+          bodyAttr: 'data-dsh-md3-wallpaper',
+        },
+      }))
+      const display = readSkinDisplay(pkg)
+      expect(display?.name).toBe('MANIFEST_NAME')
+      expect(display?.author).toBe('AnNingUI')
+      expect(display?.accent).toBe('#ff0000')
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true })
+    }
   })
 })
 

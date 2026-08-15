@@ -22,7 +22,7 @@ import { readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join as joinPath } from 'node:path'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
-import { currentSkin, useSkin, SKINS_DIR, listSkinDirCandidates, resolvePaths } from './skin-switch.ts'
+import { currentSkin, useSkin, SKIN_ROOTS, listSkinDirCandidates, readSkinDisplay, resolvePaths } from './skin-switch.ts'
 
 /** Browser-facing base path of the skin-center API. */
 export const SKIN_CENTER_API_PREFIX = '/api/skin-center'
@@ -165,12 +165,11 @@ export interface SkinCenterRoutesDeps {
 }
 
 /**
- * Map skin id -> directory under the skins root, scanned from each
- * skin.json. The id is validated against this map (never used as a raw
- * path) so the bundle route cannot be walked off the skins tree. The root
- * resolves per install layout (monorepo packages/skins/, npm
- * node_modules/@linxin666/) and candidates include the bundled dsh-skins
- * carrier (npm layout) — see skin-switch resolveSkinsDir /
+ * Map skin id -> directory, scanned from each skin.json across EVERY
+ * skin-home root (monorepo packages/skins/, the @linxin666 home, and any
+ * external-scope home such as @AnNingUI). The id is validated against this
+ * map (never used as a raw path) so the bundle route cannot be walked off
+ * the skins tree — see skin-switch resolveSkinRoots /
  * listSkinDirCandidates.
  * @returns skin id -> directory name.
  */
@@ -180,21 +179,25 @@ export interface SkinCenterRoutesDeps {
 let directoriesCache: { key: string; map: Map<string, string> } | null = null
 
 function skinDirectories(): Map<string, string> {
-  const rootStat = statSync(SKINS_DIR, { throwIfNoEntry: false })
-  const carrierStat = statSync(joinPath(SKINS_DIR, 'dsh-skins', 'skins'), { throwIfNoEntry: false })
-  const key = `${rootStat?.mtimeMs ?? -1}|${carrierStat?.mtimeMs ?? -1}`
-  if (directoriesCache !== null && directoriesCache.key === key) return directoriesCache.map
+  const keys = SKIN_ROOTS.map((root) => {
+    const rootStat = statSync(root, { throwIfNoEntry: false })
+    const carrierStat = statSync(joinPath(root, 'dsh-skins', 'skins'), { throwIfNoEntry: false })
+    return `${rootStat?.mtimeMs ?? -1}|${carrierStat?.mtimeMs ?? -1}`
+  }).join('~')
+  if (directoriesCache !== null && directoriesCache.key === keys) return directoriesCache.map
   const out = new Map<string, string>()
-  for (const dir of listSkinDirCandidates(SKINS_DIR)) {
-    let meta: { id?: unknown }
-    try {
-      meta = JSON.parse(readFileSync(joinPath(dir, 'skin.json'), 'utf8'))
-    } catch {
-      continue
+  for (const root of SKIN_ROOTS) {
+    for (const dir of listSkinDirCandidates(root)) {
+      let meta: { id?: unknown }
+      try {
+        meta = JSON.parse(readFileSync(joinPath(dir, 'skin.json'), 'utf8'))
+      } catch {
+        continue
+      }
+      if (typeof meta.id === 'string' && /^[a-z0-9-]+$/.test(meta.id)) out.set(meta.id, dir)
     }
-    if (typeof meta.id === 'string' && /^[a-z0-9-]+$/.test(meta.id)) out.set(meta.id, dir)
   }
-  directoriesCache = { key, map: out }
+  directoriesCache = { key: keys, map: out }
   return out
 }
 
@@ -248,6 +251,41 @@ function bundleRoute(): WebRoute {
 }
 
 /**
+ * The runtime registry route: every skin discovered across ALL skin-home roots
+ * (the monorepo `packages/skins/`, the `@linxin666` home, and any external
+ * `@scope` home), with its GUI display metadata. The prebuilt
+ * `generated/skins.ts` can only ever cover the monorepo; this route is what
+ * lets EXTERNAL skins (e.g. `@AnNingUI/dsh-client-ui-skin-*`) surface in the
+ * skin-center card without a code regeneration, per skin.json `manifest` (the
+ * explicit registration block) with top-level fallback.
+ * @returns the prefix route (matches /api/skin-center/registry).
+ */
+function registryRoute(): WebRoute {
+  const path = `${SKIN_CENTER_API_PREFIX}/registry`
+  return {
+    kind: 'exact',
+    path,
+    handler: (req: IncomingMessage, res: ServerResponse): void => {
+      if (!requireMethod(req, res, 'GET')) return
+      if (!requireSameOrigin(req, res)) return
+      const entries: unknown[] = []
+      const seen = new Set<string>()
+      for (const root of SKIN_ROOTS) {
+        for (const dir of listSkinDirCandidates(root)) {
+          const display = readSkinDisplay(dir)
+          if (display === null) continue
+          if (seen.has(display.id)) continue // prebuilt/direct wins; skip dupes
+          seen.add(display.id)
+          entries.push(display)
+        }
+      }
+      entries.sort((a, b) => String((a as Record<string, string>).id).localeCompare(String((b as Record<string, string>).id)))
+      json(res, 200, { ok: true, skins: entries })
+    },
+  }
+}
+
+/**
  * Build the skin-center route family.
  * @param deps - optional runner override (tests).
  */
@@ -279,6 +317,7 @@ export function makeSkinCenterRoutes(deps: SkinCenterRoutesDeps = {}): WebRoute[
       active: await current(),
     })),
     bundleRoute(),
+    registryRoute(),
     postRoute(`${SKIN_CENTER_API_PREFIX}/apply`, async (body) => {
       const official = body.official === true
       const skin = body.skin

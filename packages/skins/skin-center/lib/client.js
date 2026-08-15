@@ -217,21 +217,28 @@ window.__ModuleLoader__.load({
 		* after the patch write can therefore boot into the previous skin. These
 		* helpers let the frontend poll the served document until the manifest
 		* actually reflects the target before reloading.
+		*
+		* The matchers are scope-agnostic: they key off the skin's full package name
+		* (`@<scope>/dsh-client-ui-skin-<id>`), so a bundle in any npm scope — the
+		* monorepo `@linxin666` home or an external `@AnNingUI` — is recognized.
 		* @module @linxin666/dsh-client-ui-skin-center/manifest
 		*/
-		/** Bundle URL pattern of any skin entry in the boot manifest. */
-		const SKIN_BUNDLE_URL = /\/plugins\/@linxin666\/dsh-client-ui-skin-(?!center)[a-z0-9-]+\/client\.js/;
+		/** Bundle URL pattern of any skin entry in the boot manifest — any scope.
+		*  Matches `/plugins/@<scope>/dsh-client-ui-skin-<id>/client.js` for any
+		*  scoped plugin package except the skin-center manager itself. */
+		const SKIN_BUNDLE_URL = /\/plugins\/@[A-Za-z0-9][A-Za-z0-9._-]*\/dsh-client-ui-skin-(?!center)[a-z0-9-]+\/client\.js/;
 		/**
 		* Whether a served GUI document's boot manifest enables the given skin.
 		* A `null` target means the stock look: no skin bundle URL may be present
 		* (the skin-center plugin's own bundle always loads and is excluded).
 		* @param documentHtml - the served GUI document (contains the boot JSON).
-		* @param target - skin id, or `null` for the stock look.
+		* @param targetPackage - the target skin's full package name
+		*   (`@<scope>/dsh-client-ui-skin-<id>`), or `null` for the stock look.
 		* @returns whether the manifest already enables the target.
 		*/
-		function manifestHasSkin(documentHtml, target) {
-			if (target === null) return !SKIN_BUNDLE_URL.test(documentHtml);
-			return documentHtml.includes(`/plugins/@linxin666/dsh-client-ui-skin-${target}/client.js`);
+		function manifestHasSkin(documentHtml, targetPackage) {
+			if (targetPackage === null) return !SKIN_BUNDLE_URL.test(documentHtml);
+			return documentHtml.includes(`/plugins/${targetPackage}/client.js`);
 		}
 		//#endregion
 		//#region src/client/try-on.ts
@@ -316,10 +323,33 @@ window.__ModuleLoader__.load({
 		function bootEntryIds() {
 			return window.__DSH_BOOT__?.entries?.map((entry) => entry.id) ?? [];
 		}
-		/** The skin package currently ACTIVE in the boot graph, if it is one of ours. */
+		/** A skin plugin package id — `@<scope>/dsh-client-ui-skin-<id>`, ANY scope. */
+		const SKIN_PACKAGE_ID = /^@[A-Za-z0-9][A-Za-z0-9._-]*\/dsh-client-ui-skin-(?!center)([a-z0-9-]+)$/;
+		/**
+		* The skin package currently ACTIVE in the boot graph, if it is one of ours.
+		* Matches the boot entry id against the prebuilt registry first (known skins
+		* carry gallery metadata), then falls back to a synthesized entry for an
+		* EXTERNAL-scope skin id (`@<scope>/dsh-client-ui-skin-<id>`) so an active
+		* external skin is still detected for try-on retraction / active badge — the
+		* generalized-discovery companion to SkinCenter's runtime registry merge.
+		*/
 		function activeSkinEntry() {
-			const ids = new Set(bootEntryIds());
-			return SKIN_CENTER_ENTRIES.find((entry) => ids.has(entry.package));
+			const ids = bootEntryIds();
+			const prebuilt = SKIN_CENTER_ENTRIES.find((entry) => ids.includes(entry.package));
+			if (prebuilt !== void 0) return prebuilt;
+			for (const id of ids) {
+				const match = SKIN_PACKAGE_ID.exec(id);
+				if (match === null) continue;
+				return {
+					id: match[1],
+					name: match[1],
+					nameEn: match[1],
+					accent: "#6750a4",
+					bodyAttr: "",
+					package: id,
+					order: void 0
+				};
+			}
 		}
 		/**
 		* Whether a direct body child is skin chrome owned by `skin`: marked with the
@@ -666,12 +696,43 @@ window.__ModuleLoader__.load({
 			const [loadingId, setLoadingId] = (0, react.useState)(null);
 			const [applying, setApplying] = (0, react.useState)(null);
 			const [error, setError] = (0, react.useState)(null);
+			const [runtimeSkins, setRuntimeSkins] = (0, react.useState)(SKIN_CENTER_ENTRIES);
 			const mounted = (0, react.useRef)(false);
 			const tryOnRequest = (0, react.useRef)(0);
 			(0, react.useEffect)(() => {
 				mounted.current = true;
 				return () => {
 					mounted.current = false;
+				};
+			}, []);
+			(0, react.useEffect)(() => {
+				let cancelled = false;
+				fetch("/api/skin-center/registry").then((response) => response.json().catch(() => null)).then((payload) => {
+					if (cancelled || payload === null || payload?.ok !== true) return;
+					const rows = Array.isArray(payload?.skins) ? payload.skins : [];
+					const merged = [...SKIN_CENTER_ENTRIES];
+					const known = new Set(merged.map((e) => e.id));
+					for (const row of rows) {
+						if (known.has(row.id)) continue;
+						if (typeof row.package !== "string" || row.package === "") continue;
+						merged.push({
+							id: row.id,
+							name: row.name ?? row.id,
+							nameEn: row.nameEn ?? row.name ?? row.id,
+							author: row.author,
+							tagline: row.tagline ?? "",
+							description: row.description,
+							tags: [],
+							accent: row.accent ?? "#6750a4",
+							bodyAttr: row.bodyAttr ?? "",
+							package: row.package,
+							order: void 0
+						});
+					}
+					if (!cancelled) setRuntimeSkins(merged);
+				}).catch(() => {});
+				return () => {
+					cancelled = true;
 				};
 			}, []);
 			const tryOn = (entry) => {
@@ -744,6 +805,17 @@ window.__ModuleLoader__.load({
 				tick();
 			});
 			/**
+			* Resolve a skin id to its full package name (`@<scope>/dsh-client-ui-skin-<id>`),
+			* or undefined when the entry is unknown. The boot manifest keys bundle URLs
+			* by package, and a generalized (any-scope) skin must be matched by package,
+			* not the scope-hardcoded id spelling.
+			* @param target - skin id, or `official` for the stock look.
+			*/
+			const targetPackage = (target) => {
+				if (target === OFFICIAL) return null;
+				return runtimeSkins.find((entry) => entry.id === target)?.package ?? null;
+			};
+			/**
 			* Poll the served GUI document until the boot manifest actually enables
 			* the target (the config watcher regenerates it asynchronously after the
 			* patch write — reloading earlier boots the page into the previous skin),
@@ -752,7 +824,7 @@ window.__ModuleLoader__.load({
 			* @returns whether the manifest caught up within the poll budget.
 			*/
 			const manifestReady = (target) => new Promise((resolve) => {
-				const expected = target === OFFICIAL ? null : target;
+				const expected = targetPackage(target);
 				let tries = 0;
 				const tick = () => {
 					if (!mounted.current) {
@@ -863,7 +935,7 @@ window.__ModuleLoader__.load({
 							className: skin_center_module_css_default.pluginName,
 							children: [t("title"), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: skin_center_module_css_default.titleBadge,
-								children: String(SKIN_CENTER_ENTRIES.length)
+								children: String(runtimeSkins.length)
 							})]
 						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: skin_center_module_css_default.cardDescription,
@@ -997,7 +1069,7 @@ window.__ModuleLoader__.load({
 										})
 									]
 								}, OFFICIAL);
-							})(), SKIN_CENTER_ENTRIES.map((entry) => {
+							})(), runtimeSkins.map((entry) => {
 								const isActive = entry.package === activePackage;
 								const isTrying = entry.id === tryingId;
 								const badge = isActive ? t("active") : isTrying ? t("tryingOn") : null;

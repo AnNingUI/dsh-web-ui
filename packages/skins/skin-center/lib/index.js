@@ -24,37 +24,101 @@ import { fileURLToPath } from "node:url";
 * @module @linxin666/dsh-client-ui-skin-center/skin-switch
 */
 /**
-* Walk up from a file location to the nearest @linxin666/ scoped dir
-* whose entries actually hold skin packages (dsh-skins carrier or
-* dsh-client-ui-skin-* packages). pnpm's virtual store realpaths packages
-* into node_modules/.pnpm/<pkg>@<ver>/node_modules/<name>, so a plain
-* '../../' from the skin-center package can never see its siblings there —
-* this anchor finds the scoped dir that owns them.
-* @param fromDir - the realpathed package dir to walk up from.
-* @returns the scoped skin dir (the skins root), or null when none is found.
+* Whether a scoped npm dir (`<root>/@<scope>/`) actually owns skin packages —
+* the skin-home test. A scope is a skin home when it holds the dsh-skins
+* carrier (`dsh-skins` with a `skins/` subdir), or any per-skin package
+* (`dsh-client-ui-skin-<id>` other than the manager itself, or a dir carrying
+* a `skin.json`). Scope-agnostic: `@linxin666`, `@AnNingUI`, `@Deepseek-ai`
+* or any other scope that carries skin packages is a skin home.
+* @param scopedDir - the `<root>/@<scope>` directory to inspect.
+* @returns true when the scope holds at least one skin.
 */
-function findScopedAnchor(fromDir) {
+function isSkinHomeDir(scopedDir) {
+	let entries;
+	try {
+		entries = readdirSync(scopedDir);
+	} catch {
+		return false;
+	}
+	for (const entry of entries) {
+		if (entry === "dsh-skins") return true;
+		if (entry.startsWith("dsh-client-ui-skin-") && entry !== "dsh-client-ui-skin-center") return true;
+		if (statSync(join(scopedDir, entry, "skin.json"), { throwIfNoEntry: false })) return true;
+	}
+	return false;
+}
+/** A scoped npm dir basename (`@linxin666`, `@AnNingUI`, ...). */
+const SCOPED_DIR_RE = /^@[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/**
+* Walk up from a file location collecting every ancestor scoped npm dir
+* (`<root>/@<scope>/`) that owns skin packages. pnpm's virtual store realpaths
+* packages into node_modules/.pnpm/<pkg>@<ver>/node_modules/<name>, so a plain
+* '../../' from the skin-center package can never see its siblings there —
+* walking up finds the scoped dirs that own them, in ANY scope, not just
+* `@linxin666`. The `@linxin666` scope is ordered first at each level when
+* present (the legacy preferred home), then the remaining skin-home scopes
+* deterministically; if no skin is found at the current level, the walk
+* continues one directory up (a profile node_modules may host multiple scopes
+* in separate `@<scope>` dirs that each bear skins).
+* @param fromDir - the realpathed package dir to walk up from.
+* @returns every skin-home scoped dir, nearest ancestor first; empty when none.
+*/
+function findScopedAnchors(fromDir) {
+	const out = [];
 	let current = fromDir;
 	for (;;) {
-		const scoped = join(current, "@linxin666");
+		let entries;
 		try {
-			for (const entry of readdirSync(scoped)) {
-				if (entry === "dsh-skins") return scoped;
-				if (entry.startsWith("dsh-client-ui-skin-") && entry !== "dsh-client-ui-skin-center") return scoped;
-			}
-		} catch {}
+			entries = readdirSync(current);
+		} catch {
+			entries = [];
+		}
+		const scopeDirs = entries.filter((entry) => SCOPED_DIR_RE.test(entry)).sort((a, b) => (b === "@linxin666" ? 1 : 0) - (a === "@linxin666" ? 1 : 0) || (a < b ? -1 : a > b ? 1 : 0));
+		for (const scope of scopeDirs) {
+			const scoped = join(current, scope);
+			if (isSkinHomeDir(scoped) && !out.includes(scoped)) out.push(scoped);
+		}
+		if (out.length > 0) return out;
 		const parent = dirname(current);
-		if (parent === current) return null;
+		if (parent === current) return out;
 		current = parent;
 	}
 }
 /**
-* Resolve the directory that holds the skin packages (each a dir carrying a
-* skin.json). Candidates, in order:
+* Every skin-home scoped dir directly under a node_modules dir (the profile
+* installs external skins in `node_modules/@<scope>/...`; this returns each
+* `@<scope>` that owns skin packages). Scope-agnostic and empty-tolerant.
+* @param nodeModulesDir - a node_modules directory (may not exist yet).
+* @returns the skin-home scoped dirs it holds;
+*/
+function skinHomesInNodeModules(nodeModulesDir) {
+	const out = [];
+	let entries;
+	try {
+		entries = readdirSync(nodeModulesDir);
+	} catch {
+		return out;
+	}
+	for (const entry of entries.sort()) {
+		if (!SCOPED_DIR_RE.test(entry)) continue;
+		const scoped = join(nodeModulesDir, entry);
+		if (isSkinHomeDir(scoped)) out.push(scoped);
+	}
+	return out;
+}
+/**
+* Resolve every directory that holds skin packages (each a dir carrying a
+* skin.json), in discovery order. Candidates, in order:
 *  - monorepo / flat npm layout: new URL('../../', import.meta.url)
 *    (packages/skins/ or node_modules/@linxin666/);
-*  - pnpm virtual-store layout: the nearest @linxin666/ scoped dir found by
-*    walking up from this package's realpathed location;
+*  - every skin-home scoped dir found by walking up from this package's
+*    realpathed location — `@linxin666` first, then any other scope
+*    (`@AnNingUI`, ...) that owns skins (generalized discovery);
+*  - every skin-home scoped dir under the ACTIVE profile's node_modules
+*    (external skins installed into the running profile — e.g.
+*    `~/.dsh/profiles/web/node_modules/@AnNingUI/`), so an external-scope
+*    skin that lives in the profile tree but NOT in the module's own tree is
+*    still discovered without a code regeneration;
 *  - the legacy '../../../skins/' spelling (which pointed at
 *    node_modules/skins/ under npm — the ENOENT of
 *    zhu1090093659/dsh-web-ui#21/#33/#34), kept as a fallback.
@@ -63,27 +127,56 @@ function findScopedAnchor(fromDir) {
 *   own import.meta.url); injectable so tests can place the module inside a
 *   simulated install layout and exercise the real candidate chain.
 */
-function resolveSkinsDir(fromUrl = import.meta.url) {
+function resolveSkinRoots(fromUrl = import.meta.url) {
 	const fromEnv = process.env.DSH_SKINS_DIR;
-	if (fromEnv !== void 0 && fromEnv !== "") return fromEnv;
+	if (fromEnv !== void 0 && fromEnv !== "") return [fromEnv];
 	const here = fileURLToPath(fromUrl);
 	const candidates = [
 		fileURLToPath(new URL("../../", fromUrl)),
-		findScopedAnchor(dirname(here)),
+		...findScopedAnchors(dirname(here)),
+		...skinHomesInNodeModules(join(resolvePaths().profileModulesDir)),
 		fileURLToPath(new URL("../../../skins/", fromUrl))
 	].filter((candidate) => candidate !== null);
-	for (const candidate of candidates) if (listSkinDirCandidates(candidate).length > 0) return candidate;
-	return candidates[0];
+	const seen = /* @__PURE__ */ new Set();
+	const out = [];
+	for (const candidate of candidates) {
+		let real;
+		try {
+			real = realpathSync(candidate);
+		} catch {
+			real = candidate;
+		}
+		if (seen.has(real)) continue;
+		seen.add(real);
+		out.push(candidate);
+	}
+	return out;
 }
-/** The skin-package root for this install (see resolveSkinsDir). */
-const SKINS_DIR = resolveSkinsDir();
+/**
+* The primary skin-package root for this install (see resolveSkinRoots) — the
+* first root that actually carries skin candidates, or the first candidate.
+* Kept as a single-string accessor for consumers that operate on one root;
+* discovery-wide paths should use {@link resolveSkinRoots} and aggregate.
+* @param fromUrl - the module URL to resolve from (see resolveSkinRoots).
+*/
+function resolveSkinsDir(fromUrl = import.meta.url) {
+	const fromEnv = process.env.DSH_SKINS_DIR;
+	if (fromEnv !== void 0 && fromEnv !== "") return fromEnv;
+	for (const candidate of resolveSkinRoots(fromUrl)) if (listSkinDirCandidates(candidate).length > 0) return candidate;
+	return resolveSkinRoots(fromUrl)[0];
+}
+/** All skin-package roots for this install (see resolveSkinRoots). */
+const SKIN_ROOTS = resolveSkinRoots();
+resolveSkinsDir();
 /** Managed patch-section delimiters (the CLI's SINGLE authority boundaries). */
 const MANAGED_START = "# --- dsh-skin managed (auto-generated; do not edit) ---";
 const MANAGED_END = "# --- end dsh-skin managed ---";
 /** Legal npm package name (scoped or unscoped). skin.json `package` is joined
 * into profile node_modules paths and rendered into YAML, so it must never
-* carry path separators, quotes, newlines, or leading dots. */
-const NPM_PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+*  carry path separators, quotes, newlines, or leading dots. Scopes may carry
+*  UPPERCASE letters (e.g. `@AnNingUI`), so both cases are allowed — only the
+*  characters and the shape matter, never a forced-lowercase assumption. */
+const NPM_PACKAGE_NAME_RE = /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 /** Legal cordis loader entry id for a skin insert row. */
 const WIRING_ID_RE = /^ui-skin-[a-z0-9-]+$/;
 /**
@@ -115,6 +208,51 @@ function readSkinMeta(absDir) {
 	}
 }
 /**
+* The skin-display metadata a skin-center card needs: the GUI-friendly fields
+* (name/gallery copy/colors/bodyAttr/preview) shipped either in a top-level
+* `manifest` block (the EXPLICIT registration manifest — the preferred source
+* for external / third-party skins that want full control over their gallery
+* card) or in the classic top-level `skin.json` fields (the fallback). Any
+* field present in `manifest` wins over the same-named top-level field.
+*
+* This is the "explicit manifest + fallback to generalized discovery" dual
+* layer: a skin.json may omit the manifest block entirely and be discovered
+* purely by shape (id/package/wiring); when it IS present, its display fields
+* drive the card.
+* @param absDir - absolute path of the candidate skin directory.
+* @returns the display record (all strings, missing fields omitted) or null
+*   when the skin.json is unreadable / has no id.
+*/
+function readSkinDisplay(absDir) {
+	let meta;
+	try {
+		meta = JSON.parse(readFileSync(join(absDir, "skin.json"), "utf8"));
+	} catch {
+		return null;
+	}
+	if (typeof meta !== "object" || meta === null) return null;
+	const record = meta;
+	if (typeof record.id !== "string") return null;
+	const manifest = typeof record.manifest === "object" && record.manifest !== null ? record.manifest : {};
+	const out = { id: record.id };
+	for (const key of [
+		"name",
+		"nameEn",
+		"author",
+		"tagline",
+		"description",
+		"accent",
+		"bodyAttr",
+		"package",
+		"previewPlugin",
+		"preview"
+	]) {
+		const value = manifest[key] ?? record[key];
+		if (typeof value === "string" && value !== "") out[key] = value;
+	}
+	return out;
+}
+/**
 * Enumerate every candidate skin directory under a skins root. Two shapes:
 *  - direct subdirectories carrying a skin.json (monorepo packages/skins/<id>,
 *    and per-skin npm packages @linxin666/dsh-client-ui-skin-<id>);
@@ -133,9 +271,10 @@ function listSkinDirCandidates(skinsDir) {
 		return out;
 	}
 	const isDir = (p) => statSync(p, { throwIfNoEntry: false })?.isDirectory() === true;
+	const legacyScope = basename(skinsDir) === "@linxin666";
 	for (const dir of entries) {
 		const candidate = join(skinsDir, dir);
-		if (lstatSync(candidate, { throwIfNoEntry: false })?.isSymbolicLink() === true) continue;
+		if (lstatSync(candidate, { throwIfNoEntry: false })?.isSymbolicLink() === true && legacyScope) continue;
 		if (!isDir(candidate)) continue;
 		if (statSync(join(candidate, "skin.json"), { throwIfNoEntry: false })) out.push(candidate);
 	}
@@ -155,18 +294,25 @@ function listSkinDirCandidates(skinsDir) {
 }
 /**
 * Derive the skin registry from each skin dir's skin.json — the single
-* source of truth (skin.json already carries package/wiring.id/bundleWired).
-* Replaces the CLI's hand-maintained SKINS dictionary, so adding a skin
-* needs no code change here. Candidate dirs come from
-* listSkinDirCandidates (direct skin dirs + the dsh-skins bundled carrier).
-* The root is injectable so tests can point at either install layout.
-* @param skinsDir - the skins root (defaults to the resolved install layout).
+* source of truth (skin.json already carries package/wiring.id/bundleWired),
+* generalized to aggregate across EVERY skin-home root (see resolveSkinRoots)
+* so external-scope skins (any `@scope`, e.g. `@AnNingUI`) are discovered
+* alongside the monorepo `packages/skins/` and the legacy `@linxin666` home.
+* Candidate dirs come from listSkinDirCandidates (direct skin dirs + the
+* dsh-skins bundled carrier).
+*
+* An explicit `skinsDir` still scans ONLY that root (tests use it to pin a
+* layout); the default scans every discovered root in `SKIN_ROOTS` order
+* (`@linxin666` before other scopes at the same ancestor, per the anchor).
+* @param skinsDir - a single skins root to scan, or omit to aggregate every
+*   discovered root (defaults to the resolved multi-root layout).
 * @returns skin id -> switch metadata.
 */
-function loadRegistry(skinsDir = SKINS_DIR) {
+function loadRegistry(skinsDir) {
+	const roots = skinsDir === void 0 ? SKIN_ROOTS : [skinsDir];
 	const out = {};
 	const seenReal = /* @__PURE__ */ new Set();
-	for (const dir of listSkinDirCandidates(skinsDir)) {
+	for (const root of roots) for (const dir of listSkinDirCandidates(root)) {
 		let real;
 		try {
 			real = realpathSync(dir);
@@ -878,12 +1024,11 @@ function postRoute(path, run) {
 	};
 }
 /**
-* Map skin id -> directory under the skins root, scanned from each
-* skin.json. The id is validated against this map (never used as a raw
-* path) so the bundle route cannot be walked off the skins tree. The root
-* resolves per install layout (monorepo packages/skins/, npm
-* node_modules/@linxin666/) and candidates include the bundled dsh-skins
-* carrier (npm layout) — see skin-switch resolveSkinsDir /
+* Map skin id -> directory, scanned from each skin.json across EVERY
+* skin-home root (monorepo packages/skins/, the @linxin666 home, and any
+* external-scope home such as @AnNingUI). The id is validated against this
+* map (never used as a raw path) so the bundle route cannot be walked off
+* the skins tree — see skin-switch resolveSkinRoots /
 * listSkinDirCandidates.
 * @returns skin id -> directory name.
 */
@@ -892,12 +1037,14 @@ function postRoute(path, run) {
 * without restarting. */
 let directoriesCache = null;
 function skinDirectories() {
-	const rootStat = statSync(SKINS_DIR, { throwIfNoEntry: false });
-	const carrierStat = statSync(join(SKINS_DIR, "dsh-skins", "skins"), { throwIfNoEntry: false });
-	const key = `${rootStat?.mtimeMs ?? -1}|${carrierStat?.mtimeMs ?? -1}`;
-	if (directoriesCache !== null && directoriesCache.key === key) return directoriesCache.map;
+	const keys = SKIN_ROOTS.map((root) => {
+		const rootStat = statSync(root, { throwIfNoEntry: false });
+		const carrierStat = statSync(join(root, "dsh-skins", "skins"), { throwIfNoEntry: false });
+		return `${rootStat?.mtimeMs ?? -1}|${carrierStat?.mtimeMs ?? -1}`;
+	}).join("~");
+	if (directoriesCache !== null && directoriesCache.key === keys) return directoriesCache.map;
 	const out = /* @__PURE__ */ new Map();
-	for (const dir of listSkinDirCandidates(SKINS_DIR)) {
+	for (const root of SKIN_ROOTS) for (const dir of listSkinDirCandidates(root)) {
 		let meta;
 		try {
 			meta = JSON.parse(readFileSync(join(dir, "skin.json"), "utf8"));
@@ -907,7 +1054,7 @@ function skinDirectories() {
 		if (typeof meta.id === "string" && /^[a-z0-9-]+$/.test(meta.id)) out.set(meta.id, dir);
 	}
 	directoriesCache = {
-		key,
+		key: keys,
 		map: out
 	};
 	return out;
@@ -973,6 +1120,40 @@ function bundleRoute() {
 	};
 }
 /**
+* The runtime registry route: every skin discovered across ALL skin-home roots
+* (the monorepo `packages/skins/`, the `@linxin666` home, and any external
+* `@scope` home), with its GUI display metadata. The prebuilt
+* `generated/skins.ts` can only ever cover the monorepo; this route is what
+* lets EXTERNAL skins (e.g. `@AnNingUI/dsh-client-ui-skin-*`) surface in the
+* skin-center card without a code regeneration, per skin.json `manifest` (the
+* explicit registration block) with top-level fallback.
+* @returns the prefix route (matches /api/skin-center/registry).
+*/
+function registryRoute() {
+	return {
+		kind: "exact",
+		path: `${SKIN_CENTER_API_PREFIX}/registry`,
+		handler: (req, res) => {
+			if (!requireMethod(req, res, "GET")) return;
+			if (!requireSameOrigin(req, res)) return;
+			const entries = [];
+			const seen = /* @__PURE__ */ new Set();
+			for (const root of SKIN_ROOTS) for (const dir of listSkinDirCandidates(root)) {
+				const display = readSkinDisplay(dir);
+				if (display === null) continue;
+				if (seen.has(display.id)) continue;
+				seen.add(display.id);
+				entries.push(display);
+			}
+			entries.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+			json(res, 200, {
+				ok: true,
+				skins: entries
+			});
+		}
+	};
+}
+/**
 * Build the skin-center route family.
 * @param deps - optional runner override (tests).
 */
@@ -1004,6 +1185,7 @@ function makeSkinCenterRoutes(deps = {}) {
 			active: await current()
 		})),
 		bundleRoute(),
+		registryRoute(),
 		postRoute(`${SKIN_CENTER_API_PREFIX}/apply`, async (body) => {
 			const official = body.official === true;
 			const skin = body.skin;

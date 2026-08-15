@@ -58,6 +58,12 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [applying, setApplying] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Runtime-discovered skins beyond the prebuilt registry (external scopes,
+  // any `@<scope>` home). The prebuilt SKIN_CENTER_ENTRIES only ever carries
+  // monorepo skins; /api/skin-center/registry merges external ones so they
+  // appear in the card without a code regeneration. Starts as the prebuilt
+  // list so the card is never empty while the registry fetch resolves.
+  const [runtimeSkins, setRuntimeSkins] = useState<SkinCenterEntry[]>(SKIN_CENTER_ENTRIES)
   // Unmount guard for the confirmation poll: once the card is gone, the
   // pending timers must stop and no reload / setState may fire.
   const mounted = useRef(false)
@@ -68,6 +74,40 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
+  }, [])
+  // Fetch external-scope skins on mount (best-effort; prebuilt list stands alone
+  // when the host is unreachable or returns nothing).
+  useEffect(() => {
+    let cancelled = false
+    void fetch('/api/skin-center/registry')
+      .then(response => response.json().catch(() => null))
+      .then(payload => {
+        if (cancelled || payload === null || payload?.ok !== true) return
+        const rows = Array.isArray(payload?.skins) ? payload.skins as Array<Record<string, string>> : []
+        // Merge: prebuilt entries win on id; external entries are appended.
+        const merged = [...SKIN_CENTER_ENTRIES]
+        const known = new Set(merged.map(e => e.id))
+        for (const row of rows) {
+          if (known.has(row.id)) continue
+          if (typeof row.package !== 'string' || row.package === '') continue
+          merged.push({
+            id: row.id,
+            name: row.name ?? row.id,
+            nameEn: row.nameEn ?? row.name ?? row.id,
+            author: row.author,
+            tagline: row.tagline ?? '',
+            description: row.description,
+            tags: [], // tags not carried by the plain string registry
+            accent: row.accent ?? '#6750a4',
+            bodyAttr: row.bodyAttr ?? '',
+            package: row.package,
+            order: undefined,
+          })
+        }
+        if (!cancelled) setRuntimeSkins(merged)
+      })
+      .catch(() => { /* host unreachable: keep the prebuilt list */ })
+    return () => { cancelled = true }
   }, [])
 
   const tryOn = (entry: SkinCenterEntry): void => {
@@ -152,6 +192,18 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
     })
 
   /**
+   * Resolve a skin id to its full package name (`@<scope>/dsh-client-ui-skin-<id>`),
+   * or undefined when the entry is unknown. The boot manifest keys bundle URLs
+   * by package, and a generalized (any-scope) skin must be matched by package,
+   * not the scope-hardcoded id spelling.
+   * @param target - skin id, or `official` for the stock look.
+   */
+  const targetPackage = (target: string): string | null => {
+    if (target === OFFICIAL) return null
+    return runtimeSkins.find(entry => entry.id === target)?.package ?? null
+  }
+
+  /**
    * Poll the served GUI document until the boot manifest actually enables
    * the target (the config watcher regenerates it asynchronously after the
    * patch write — reloading earlier boots the page into the previous skin),
@@ -161,7 +213,7 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
    */
   const manifestReady = (target: string): Promise<boolean> =>
     new Promise(resolve => {
-      const expected = target === OFFICIAL ? null : target
+      const expected = targetPackage(target)
       let tries = 0
       const tick = (): void => {
         if (!mounted.current) {
@@ -291,7 +343,7 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
         <span className={css.headText}>
           <span className={css.pluginName}>
             {t('title')}
-            <span className={css.titleBadge}>{String(SKIN_CENTER_ENTRIES.length)}</span>
+            <span className={css.titleBadge}>{String(runtimeSkins.length)}</span>
           </span>
           <span className={css.cardDescription} title={t('cardDescription')}>{t('cardDescription')}</span>
         </span>
@@ -386,7 +438,7 @@ export function SkinCenter({ t, controller, theme, background }: SkinCenterCompo
                 )
               })()}
 
-              {SKIN_CENTER_ENTRIES.map(entry => {
+              {runtimeSkins.map(entry => {
                 const isActive = entry.package === activePackage
                 const isTrying = entry.id === tryingId
                 const badge = isActive ? t('active') : isTrying ? t('tryingOn') : null
