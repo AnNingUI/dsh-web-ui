@@ -671,14 +671,42 @@ export function activeSkinIsBundleWired(entry: SkinSwitchEntry, profileModulesDi
 }
 
 /**
+ * Whether the skin's loader entry is already inserted by the ACTIVE profile's
+ * own patch layer (`~/.dsh/profiles/<profile>/cordis.patch.yml`). This is the
+ * third way a skin gets wired (alongside the bundle layer and the profile
+ * manifest `dsh.profile.bundles`/`dependencies`): an EXTERNAL non-bundle-wired
+ * skin (e.g. `@AnNingUI/dsh-client-ui-skin-*`) is often loaded by a manual
+ * `- insert:` row in the profile patch. When that row exists, the home-layer
+ * managed section must NOT add a duplicate insert (issue #148 duplicate
+ * loader entry id) — the profile patch already provides the load declaration.
+ * @param profilePatchPath - the active profile's `cordis.patch.yml` path.
+ * @param id - the loader entry id (skin.json wiring.id) to probe for.
+ * @returns true when the profile patch contains an insert of `id`.
+ */
+function profilePatchInsertsId(profilePatchPath: string | undefined, id: string): boolean {
+  if (profilePatchPath === undefined) return false
+  let patch: string
+  try {
+    patch = readFileSync(profilePatchPath, 'utf8')
+  } catch {
+    return false
+  }
+  return patchHasInsertId(patch, id)
+}
+
+/**
  * Copy a registry with `bundleWired` enriched from the profile layout, so
  * patch rendering and active reading agree on skins whose insert row the
- * installed per-skin bundle provides.
+ * installed per-skin bundle — OR the active profile's own patch layer —
+ * provides. The profile patch is the authoritative extra wire for external
+ * skins.
  */
-function registryWithProfileWiring(registry: Record<string, SkinSwitchEntry>, profileModulesDir: string, profileManifestPath?: string): Record<string, SkinSwitchEntry> {
+function registryWithProfileWiring(registry: Record<string, SkinSwitchEntry>, profileModulesDir: string, profileManifestPath?: string, profilePatchPath?: string): Record<string, SkinSwitchEntry> {
   const out: Record<string, SkinSwitchEntry> = {}
   for (const [name, entry] of Object.entries(registry)) {
-    out[name] = activeSkinIsBundleWired(entry, profileModulesDir, profileManifestPath) ? { ...entry, bundleWired: true } : entry
+    const wired = activeSkinIsBundleWired(entry, profileModulesDir, profileManifestPath) ||
+      profilePatchInsertsId(profilePatchPath, entry.id)
+    out[name] = wired ? { ...entry, bundleWired: true } : entry
   }
   return out
 }
@@ -693,6 +721,9 @@ export interface SkinSwitchPaths {
   profileModulesDir: string
   /** ~/.dsh/profiles/<profile>/package.json (dsh.profile.bundles wiring). */
   profileManifestPath: string
+  /** ~/.dsh/profiles/<profile>/cordis.patch.yml (the profile's own patch
+   *  layer — where an external non-bundle-wired skin's load insert lives). */
+  profilePatchPath: string
 }
 
 /**
@@ -853,6 +884,7 @@ export function resolvePaths(home?: string, profile?: string, fromUrl: string = 
     patchPath: joinPath(harnessHome, 'cordis.patch.yml'),
     profileModulesDir: joinPath(harnessHome, 'profiles', activeProfile, 'node_modules'),
     profileManifestPath: joinPath(harnessHome, 'profiles', activeProfile, 'package.json'),
+    profilePatchPath: joinPath(harnessHome, 'profiles', activeProfile, 'cordis.patch.yml'),
   }
 }
 
@@ -1106,7 +1138,7 @@ export function useSkin(name: string, opts: { home?: string; profile?: string; r
     // dsh.profile.bundles in the profile manifest is authoritative; a
     // symlinked bundled-carrier target otherwise returns false here, so that
     // layout keeps its home insert row (no per-skin bundle patch is active).
-    renderRegistry = registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath)
+    renderRegistry = registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath, paths.profilePatchPath)
   }
 
   const patch = stripLegacySkinRows(stripManaged(readPatch(paths.patchPath)))
@@ -1133,5 +1165,5 @@ export function currentSkin(patch: string | undefined, opts: { home?: string; pr
   // Mirror useSkin's wiring view: an installed per-skin bundle provides its
   // own insert row, so the home patch carries only disabled rows for it and
   // currentActive must treat it as bundle-wired to report it as active.
-  return currentActive(patch ?? readPatch(paths.patchPath), registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath)) ?? 'none'
+  return currentActive(patch ?? readPatch(paths.patchPath), registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath, paths.profilePatchPath)) ?? 'none'
 }

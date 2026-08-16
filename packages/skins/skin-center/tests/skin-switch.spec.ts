@@ -9,7 +9,7 @@
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readlinkSync, rmSync, existsSync, symlinkSync, lstatSync, realpathSync, chmodSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 
@@ -1153,6 +1153,40 @@ describe('skin display metadata from skin.json manifest block (explicit registra
     } finally {
       rmSync(fakeRoot, { recursive: true, force: true })
     }
+  })
+
+  it('useSkin does not duplicate the insert in the home layer when the profile patch already wires an external skin', () => {
+    const h = fakeHome()
+    const registry = loadRegistry()
+    // A real, resolvable external skin package installed into the profile
+    // node_modules (its own bundle patch would also insert the row, but its
+    // load is declared by the ACTIVE PROFILE's cordis.patch.yml).
+    const md3 = registry['md3-wallpaper']
+    // Build a registry entry even if md3 isn't in the ambient monorepo scan.
+    const entry: SkinSwitchEntry = md3 ?? {
+      pkg: '@AnNingUI/dsh-client-ui-skin-md3-wallpaper',
+      id: 'ui-skin-md3-wallpaper',
+      dir: join(resolvePaths(h, 'web').profileModulesDir, '@AnNingUI', 'dsh-client-ui-skin-md3-wallpaper'),
+      bundleWired: false,
+    }
+    const dir = entry.dir
+    makeSkinPackage(dir, { pkg: entry.pkg, id: entry.id })
+    const fakeRegistry: Record<string, SkinSwitchEntry> = { ...registry, 'md3-wallpaper': { ...entry, dir } }
+    // The profile patch declares the external skin's load insert.
+    const profilePatch = resolvePaths(h, 'web').profilePatchPath
+    mkdirSync(dirname(profilePatch), { recursive: true })
+    writeFileSync(profilePatch, `- insert:\n    - id: ${entry.id}\n      name: '${entry.pkg}'\n`)
+    // Home patch starts empty.
+    writeFileSync(patchPath(h), '')
+
+    useSkin('md3-wallpaper', { home: h, profile: 'web', registry: fakeRegistry })
+
+    const after = readFileSync(patchPath(h), 'utf8')
+    // The home layer must NOT re-insert md3 (profile patch already wires it);
+    // it only keeps the mutual-exclusion disabled rows for the others.
+    expect(after).not.toContain(`      name: '${entry.pkg}'`)
+    expect(after).toContain(MANAGED_START)
+    expect(currentSkin(after, { home: h, profile: 'web', registry: fakeRegistry })).toBe('md3-wallpaper')
   })
 })
 
