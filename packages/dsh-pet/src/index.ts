@@ -19,12 +19,14 @@ import { PetService, PET_SETTINGS_NAMESPACE, type PetConfig, type PetSettingsSec
 import { makePetRoutes } from './routes.ts'
 import { loadPetRegistry, petPackageRoot } from './registry.ts'
 import { DISPLAY_INSET_MAX, DISPLAY_SIZE_MAX, DISPLAY_SIZE_MIN } from './persist.ts'
+import { mountOnce } from './mount-once.ts'
 
-export { PetService } from './service.ts'
+export { PetService, MAX_SESSION_BUBBLES } from './service.ts'
 export type {
   PetConfig,
   PetInteractResult,
   PetSettingsSection,
+  PetSessionView,
   PetStateView,
 } from './service.ts'
 export {
@@ -60,6 +62,16 @@ export {
   settleTreatGrants,
 } from './treats.ts'
 export type { TreatConfig, TreatLedger, TreatSettlement } from './treats.ts'
+export {
+  BUILTIN_REMARKS,
+  REMARK_KINDS,
+  REMARK_LINE_MAX,
+  REMARK_LINES_MAX,
+  RemarkPicker,
+  builtinRemark,
+  normalizePetRemarks,
+} from './remarks.ts'
+export type { PetRemarks, PetRemarksManifest, RemarkKind } from './remarks.ts'
 export {
   DEFAULT_PET_ID,
   DEFAULT_PET_NAME,
@@ -126,7 +138,9 @@ export function makePetSettingsSchema(fallbackPetId: string) {
 }
 
 /** Register the pet service and its API + asset routes on the context. */
-export function apply(ctx: Context, config: PetConfig = {}): void {
+export const apply = mountOnce('@linxin666/dsh-pet', applyImpl)
+
+function applyImpl(ctx: Context, config: PetConfig = {}): void {
   const registry = config.registry
     ?? loadPetRegistry({
       packageRoot: petPackageRoot(import.meta.url),

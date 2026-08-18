@@ -20,8 +20,10 @@ export const FAMILY_NAMESPACES = [
   'remote-web-ui',
   'live-stats',
   'pet',
+  'aionui-panel',
   'describe-image',
   'skin-background',
+  'community-plugins',
 ] as const
 
 /**
@@ -47,8 +49,12 @@ const NAMESPACE_ALIASES: Readonly<Record<string, string | null>> = {
   'skin-background': 'skin-background',
   'describe-image': 'describe-image',
   'dsh-tool-describe-image': 'describe-image',
-  'dsh-aionui-panel': null,
-  'dsh-client-ui-aionui-panel': null,
+  'community-plugins': 'community-plugins',
+  'dsh-community-plugins': 'community-plugins',
+  'dsh-client-ui-community-plugins': 'community-plugins',
+  'aionui-panel': 'aionui-panel',
+  'dsh-aionui-panel': 'aionui-panel',
+  'dsh-client-ui-aionui-panel': 'aionui-panel',
   'dsh-git-graph': null,
   'dsh-client-ui-git-graph': null,
   'dsh-web-ui': null,
@@ -131,14 +137,17 @@ export function extractWebSettingsNamespaces(text: string): string[] {
     return entries
   }
   const lines = text.split(/\r?\n/)
-  const start = lines.findIndex(line => /^\s*web_settings_namespaces\s*:\s*$/.test(line.trim()))
+  const start = lines.findIndex(line => /^\s*web_settings_namespaces\s*:\s*(?:#.*)?$/.test(line.trim()))
   if (start < 0) return []
   const entries: string[] = []
   for (const line of lines.slice(start + 1)) {
-    if (line.trim() === '') break
-    if (!/^\s/.test(line)) break
     const trimmed = line.trim()
+    if (trimmed === '') break
     if (trimmed.startsWith('#')) continue
+    // A sequence item may sit at column 0 (YAML allows unindented list items
+    // under a key); only a non-indented, non-item line starts the next
+    // top-level key and ends this block.
+    if (!/^\s/.test(line) && !trimmed.startsWith('-')) break
     const name = entryOfItem(trimmed)
     if (name !== undefined) entries.push(name)
   }

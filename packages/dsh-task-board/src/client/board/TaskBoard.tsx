@@ -9,17 +9,9 @@ import { COLUMNS, type TaskRecord, type TaskStatus } from '../../core/tasks.ts'
 import { t, type TaskBoardKey } from '../locales.ts'
 import css from '../board.module.css'
 import { NewTaskModal } from './NewTaskModal.tsx'
+import { STATUS_KEY } from './status-key.ts'
 import { TaskCard } from './TaskCard.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
-
-/** Column status → locale key. */
-const STATUS_KEY: Record<TaskStatus, TaskBoardKey> = {
-  backlog: 'board.status.backlog',
-  todo: 'board.status.todo',
-  running: 'board.status.running',
-  done: 'board.status.done',
-  failed: 'board.status.failed',
-}
 
 /** Case-insensitive title/description match. */
 function matchesFilter(task: TaskRecord, filter: string): boolean {
@@ -34,9 +26,9 @@ function matchesFilter(task: TaskRecord, filter: string): boolean {
  * re-renders only when its own task changes — not when a sibling card status,
  * the filter, or the selection moves.
  */
-const MemoTaskCard = memo(function MemoTaskCard({ task, onOpen }: { task: TaskRecord; onOpen: (id: string) => void }) {
+const MemoTaskCard = memo(function MemoTaskCard({ task, pending, timeZone, onOpen }: { task: TaskRecord; pending: boolean; timeZone?: string; onOpen: (id: string) => void }) {
   const onClick = useCallback(() => { onOpen(task.id) }, [task.id, onOpen])
-  return <TaskCard task={task} onClick={onClick} />
+  return <TaskCard task={task} pending={pending} timeZone={timeZone} onClick={onClick} />
 })
 
 /** Board component; subscribes to the controller snapshot. */
@@ -49,13 +41,35 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
   const [filter, setFilter] = useState('')
   const [showNew, setShowNew] = useState(false)
   const selected = selectedTaskOf(snapshot)
-  const visible = snapshot.tasks.filter(task => matchesFilter(task, filter))
+  const archiveView = snapshot.archiveView
+  // Archived tasks leave the columns; the archive view shows them instead.
+  const visible = snapshot.tasks.filter(task =>
+    (archiveView ? task.archivedAt !== undefined : task.archivedAt === undefined)
+    && matchesFilter(task, filter),
+  )
   const openTask = useCallback((id: string): void => { controller.openTask(id) }, [controller])
 
   return (
     <div className={css.board} data-dsh-taskboard-board="">
       <header className={css.boardHeader}>
+        <button
+          type="button"
+          className={`${css.ghostButton} ${css.backButton}`}
+          aria-label={t('board.close')}
+          onClick={() => { controller.closeBoard() }}
+        >
+          <span aria-hidden="true">‹</span>
+          <span>{t('board.close')}</span>
+        </button>
         <h2 className={css.boardTitle}>{t('board.title')}</h2>
+        {snapshot.host !== undefined && (
+          <span className={css.detailMeta}>
+            {t('board.hostMeta', {
+              revision: String(snapshot.host.revision),
+              timeZone: snapshot.host.scheduler.timeZone,
+            })}
+          </span>
+        )}
         <input
           className={css.search}
           type="search"
@@ -66,39 +80,65 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
         />
         <button
           type="button"
+          className={archiveView ? css.primaryButton : css.ghostButton}
+          onClick={() => { controller.toggleArchiveView() }}
+        >
+          {archiveView
+            ? t('board.backToBoard')
+            : t('board.archiveView', { count: String(snapshot.tasks.filter(task => task.archivedAt !== undefined).length) })}
+        </button>
+        <button
+          type="button"
           className={css.primaryButton}
           onClick={() => { setShowNew(true) }}
         >
           + {t('board.new')}
         </button>
-        <button
-          type="button"
-          className={css.ghostButton}
-          onClick={() => { controller.closeBoard() }}
-        >
-          {t('board.close')}
-        </button>
       </header>
 
+      {snapshot.transportError !== undefined && (
+        <div className={css.formError}>
+          {t('board.hostError', { error: snapshot.transportError })}{' '}
+          <button type="button" className={css.linkButton} onClick={() => { void controller.retryHostSync() }}>
+            {t('board.retryHost')}
+          </button>
+        </div>
+      )}
+
       <div className={css.columns}>
-        {COLUMNS.map(column => {
-          const tasks = visible.filter(task => task.status === column.status)
-          return (
-            <section key={column.status} className={css.column} data-status={column.status}>
-              <header className={css.columnHeader}>
-                <span className={css.statusDot} data-status={column.status} aria-hidden="true" />
-                <h3 className={css.columnTitle}>{t(STATUS_KEY[column.status])}</h3>
-                <span className={css.columnCount}>{tasks.length}</span>
-              </header>
-              <div className={css.cards}>
-                {tasks.map(task => (
-                  <MemoTaskCard key={task.id} task={task} onOpen={openTask} />
-                ))}
-                {tasks.length === 0 && <div className={css.columnEmpty}>{t('board.empty')}</div>}
-              </div>
-            </section>
-          )
-        })}
+        {archiveView ? (
+          <section className={css.column} data-status="archived">
+            <header className={css.columnHeader}>
+              <h3 className={css.columnTitle}>{t('board.archive')}</h3>
+              <span className={css.columnCount}>{visible.length}</span>
+            </header>
+            <div className={css.cards}>
+              {visible.map(task => (
+                <MemoTaskCard key={task.id} task={task} pending={snapshot.pendingTaskIds.includes(task.id)} timeZone={snapshot.host?.scheduler.timeZone} onOpen={openTask} />
+              ))}
+              {visible.length === 0 && <div className={css.columnEmpty}>{t('archive.empty')}</div>}
+            </div>
+          </section>
+        ) : (
+          COLUMNS.map(column => {
+            const tasks = visible.filter(task => task.status === column.status)
+            return (
+              <section key={column.status} className={css.column} data-status={column.status}>
+                <header className={css.columnHeader}>
+                  <span className={css.statusDot} data-status={column.status} aria-hidden="true" />
+                  <h3 className={css.columnTitle}>{t(STATUS_KEY[column.status])}</h3>
+                  <span className={css.columnCount}>{tasks.length}</span>
+                </header>
+                <div className={css.cards}>
+                  {tasks.map(task => (
+                    <MemoTaskCard key={task.id} task={task} pending={snapshot.pendingTaskIds.includes(task.id)} timeZone={snapshot.host?.scheduler.timeZone} onOpen={openTask} />
+                  ))}
+                  {tasks.length === 0 && <div className={css.columnEmpty}>{t('board.empty')}</div>}
+                </div>
+              </section>
+            )
+          })
+        )}
       </div>
 
       {selected !== undefined && (

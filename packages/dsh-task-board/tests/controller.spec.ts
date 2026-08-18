@@ -114,6 +114,20 @@ describe('BoardController lifecycle', () => {
     expect(reloaded.getSnapshot().tasks.map(task => task.id)).toEqual(['task-a'])
   })
 
+  it('reloadFromStore replaces the in-memory ledger from the persisted store, silently', () => {
+    const { controller, store } = makeController()
+    controller.createTask({ title: 'a', description: '', prompt: '' })
+    // A sibling tab deletes the task behind this controller's back (the
+    // persisted store is rewritten); the scheduler-facing reload must pick
+    // the freshest truth up without re-rendering UI subscribers.
+    store.save([])
+    let notified = 0
+    controller.subscribe(() => { notified += 1 })
+    controller.reloadFromStore()
+    expect(controller.getSnapshot().tasks).toEqual([])
+    expect(notified).toBe(0)
+  })
+
   it('dispose unsubscribes (no more notifications)', () => {
     const { controller, sessions } = makeController()
     let count = 0
@@ -132,6 +146,20 @@ describe('task mutations', () => {
     expect(controller.getSnapshot().tasks).toHaveLength(1)
     expect(store.load()[0].title).toBe('新任务')
     expect(controller.createTask({ title: '   ', description: '', prompt: '' })).toBeUndefined()
+  })
+
+  it('uses the default uuid path to mint UUIDv4 task ids', () => {
+    const controller = new BoardController({
+      store: new InMemoryTaskStore(),
+      exec: new StubExec() as unknown as ExecutionService,
+      sessions: new FakeSessions(),
+      now: () => NOW,
+    })
+    controller.start()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(task.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    // crypto.randomUUID is available under node, so the result is provider-agnostic.
+    expect(task.id).not.toMatch(/^t-/)
   })
 
   it('deletes and clears the selection when the selected task is removed', () => {
@@ -261,6 +289,20 @@ describe('run loop', () => {
     expect(exec.runCalls).toHaveLength(2)
   })
 
+  it('rejects manual runs and reruns of archived tasks', async () => {
+    const stub = new StubExec()
+    const { controller, stub: exec } = makeController(stub)
+    const task = controller.createTask({ title: '归档任务', description: '', prompt: '干活' })!
+    controller.moveTask(task.id, 'done')
+    expect(controller.archiveTask(task.id)).toBe(true)
+
+    expect(await controller.runTask(task.id)).toBe(false)
+    await controller.rerunTask(task.id)
+
+    expect(exec.runCalls).toHaveLength(0)
+    expect(controller.getSnapshot().tasks[0]).toMatchObject({ status: 'done', archivedAt: NOW })
+  })
+
   it('reconciles running tasks left over from a previous load', async () => {
     const stub = new StubExec()
     stub.reconcileResult = { kind: 'settled', taskId: 'task-a', executionId: 'e1', outcome: 'cancelled', error: 'gone' }
@@ -357,6 +399,16 @@ describe('scheduling', () => {
     expect(persisted.schedule?.enabled).toBe(true)
     expect(persisted.schedule?.cron).toBe('* * * * *')
     expect(persisted.schedule?.nextRunAt).toBeDefined()
+  })
+
+  it('does not let archived tasks re-enable their schedules', () => {
+    const { controller, store } = makeController()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(controller.setSchedule(task.id, { enabled: true, cron: '* * * * *' })).toBe(true)
+    controller.moveTask(task.id, 'done')
+    expect(controller.archiveTask(task.id)).toBe(true)
+    expect(store.load()[0].schedule).toMatchObject({ enabled: false, nextRunAt: undefined })
+    expect(controller.setSchedule(task.id, { enabled: true, cron: '* * * * *' })).toBe(false)
   })
 
   it('rejects blank or invalid cron expressions without touching state', () => {

@@ -13,41 +13,16 @@
 
 import type { IncomingMessage } from 'node:http'
 import type { PairingService } from './pairing.ts'
+import { isLoopbackAddress, isLoopbackHostname } from './loopback.ts'
 
 /**
- * Whether a normalized URL hostname names the local loopback authority.
- * Semantics mirror the connection package's internal predicate (localhost,
- * IPv6 loopback, any IPv4 address in 127/8); it is reimplemented here because
- * the connection package no longer exports it — the fence now lives inside
- * the connection plugin, and external host plugins only need the
- * classification, not the whole trust decision.
+ * Loopback classification for the desktop client. The predicates now live in
+ * the shared synced copy (shared/host/loopback.ts, mirrored to ./loopback.ts
+ * by scripts/sync-shared.mjs): localhost, IPv6 loopback, and any IPv4 address
+ * in 127/8.
  * @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).
  * @returns true for localhost, IPv6 loopback, or any IPv4 address in 127/8.
  */
-export function isLoopbackHostname(hostname: string): boolean {
-  if (hostname === 'localhost' || hostname === '[::1]') return true
-  const parts = hostname.split('.')
-  return parts.length === 4
-    && parts[0] === '127'
-    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
-
-/** Whether a socket remote address names the loopback range (127/8, ::1, IPv4-mapped). */
-export function isLoopbackAddress(address: string | undefined): boolean {
-  if (address === undefined) return false
-  const normalized = address.toLowerCase()
-  if (normalized === '::1') return true
-  if (normalized.startsWith('::ffff:')) return isIPv4Loopback(normalized.slice('::ffff:'.length))
-  return isIPv4Loopback(normalized)
-}
-
-/** IPv4 127/8 predicate (four decimal octets, first == 127). */
-function isIPv4Loopback(v4: string): boolean {
-  const parts = v4.split('.')
-  return parts.length === 4
-    && parts[0] === '127'
-    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
 
 /**
  * Read one cookie value from a Cookie header.
@@ -114,8 +89,20 @@ export function makeGateListener(
     if (!active) return false
     const require = typeof requirePairingForLan === 'function' ? requirePairingForLan() : requirePairingForLan
     if (!require) return next()
-    const deviceId = readCookie(request.headers.cookie, service.config.cookieName)
-    if (deviceId === undefined) return false
-    return service.touchDevice(deviceId) ? next() : false
+    return isPairedDeviceRequest(service, request) ? next() : false
   }
+}
+
+/**
+ * Whether a request carries a live, non-revoked paired-device cookie for
+ * this service. Sibling host routes outside /api (aionui-panel, etc.) use
+ * the same check via the remoteWebUiPairing service.
+ * @param service - the pairing service that owns the device table.
+ * @param request - the incoming HTTP request.
+ * @returns true when the cookie names a live session (and lastSeenAt was refreshed).
+ */
+export function isPairedDeviceRequest(service: PairingService, request: IncomingMessage): boolean {
+  const deviceId = readCookie(request.headers.cookie, service.config.cookieName)
+  if (deviceId === undefined) return false
+  return service.touchDevice(deviceId)
 }

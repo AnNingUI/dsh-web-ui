@@ -29,9 +29,8 @@ export interface ExecutionRecord {
 }
 
 /**
- * A scheduled-run rule attached to a task. The browser-side scheduler ticks
- * every minute and triggers the task when `nextRunAt` is due; the rule is
- * persisted with the task (localStorage), so scheduling survives refreshes.
+ * A scheduled-run rule attached to a task. The Host scheduler triggers the
+ * task when `nextRunAt` is due and persists the rule in the Host ledger.
  */
 export interface ScheduleRule {
   /** Whether the schedule is armed. */
@@ -79,7 +78,17 @@ export interface TaskRecord {
    * `/permission <id>` slash command; absent leaves the session default.
    */
   permission?: TaskPermission
+  /**
+   * When the task was archived (ms epoch). Archived tasks keep their status
+   * and execution history, leave the main board, and cannot run until restored;
+   * absent means on-board.
+   */
+  archivedAt?: number
 }
+
+/** Statuses a settled task may be archived from. */
+export const ARCHIVABLE_STATUSES: readonly TaskStatus[] = ['done', 'failed']
+
 
 /** Permission presets a task may pin on its execution session (the `/permission <id>` ids). */
 export const TASK_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access'] as const
@@ -103,6 +112,12 @@ export interface NewTaskInput {
   mode?: string
   /** Permission preset applied to the execution session; absent = session default. */
   permission?: TaskPermission
+  /**
+   * Optional scheduled-run rule requested at creation time (the new-task
+   * dialog): an enable flag plus a 5-field cron expression. The create use
+   * case arms it only when enabled and the expression is valid.
+   */
+  schedule?: { enabled: boolean; cron: string }
 }
 
 /** The five kanban columns, in display order. */
@@ -131,12 +146,12 @@ export function isTaskStatus(value: unknown): value is TaskStatus {
 }
 
 /** Whether a manual move target is allowed from the given status. */
-export function canMoveManually(_from: TaskStatus, to: TaskStatus): boolean {
-  return (MANUAL_STATUSES as readonly TaskStatus[]).includes(to)
+export function canMoveManually(from: TaskStatus, to: TaskStatus): boolean {
+  return from !== 'running' && (MANUAL_STATUSES as readonly TaskStatus[]).includes(to)
 }
 
 /** Normalize one optional execution-target string: trim; blank collapses to undefined. */
-function normalizeTargetId(value: string | undefined): string | undefined {
+export function normalizeTargetId(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
   return trimmed === undefined || trimmed === '' ? undefined : trimmed
 }

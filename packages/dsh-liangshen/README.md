@@ -2,17 +2,19 @@
 
 English | [中文](README.zh.md)
 
-Ships the "Anchored Standard" preset as a one-command plugin of the dsh-web-ui family: on host startup it syncs the bundled preset into `~/.dsh/.agent-presets`, so new sessions can pick "梁神模式" from the preset picker. The first model request sees only the builtin Minimal preset's exact two tools — persistent `bash` plus `str_replace_editor` — only the one-line persona prompt section, no runtime contexts, and no injected instructions; after the anchor is established the wire switches to Code Mode (PTC) and the ordinary injections open. Built entirely on the official NPM SDK — no dsh source changes.
+Ships the "Anchored Standard" preset as a one-command plugin of the dsh-web-ui family: on host startup it syncs the bundled preset into `~/.dsh/.agent-presets`, so new sessions can pick "梁神模式" from the preset picker. The first model request sees only the builtin Minimal preset's exact two tools — persistent `bash` plus `str_replace_editor` — only the one-line persona prompt section, no runtime contexts, and no injected instructions; after the anchor is established the wire switches to PTC Mode and the ordinary injections open. Built entirely on the official NPM SDK — no dsh source changes.
 
 ## Why
 
 DeepSeek V4 Pro conditions strongly on the API tool catalog visible in the FIRST request when choosing its execution trajectory. In the community eval ([xiaobright/modeltest](https://github.com/xiaobright/modeltest)), Standard / PTC scored 91/92 while Minimal reached 99/96 — but Minimal keeps only two tools. This two-phase approach separates the first-trajectory choice from full later capability:
 
 1. The first model request exposes only the builtin Minimal preset's exact two tools (persistent `bash` plus `str_replace_editor`), keeps only the `deployment:persona` prompt section, empties runtime contexts, and passes only the user's own messages;
-2. After the session's first durable `tool/call`, promotion waits until the first reasoning block is minimal-like (contains `we` and no `let me`), with a four-step fallback; the wire then switches to Code Mode (PTC) — a single `run_code` tool backed by the full tool registry SDK — and every assembled prompt section plus the ordinary workspace-instruction, skill-catalog, and runtime-context injections return;
+2. After the session's first durable `tool/call`, promotion waits until the first reasoning block is minimal-like (contains `we` and no `let me`), with a four-step fallback; the wire then switches to PTC Mode — a single `run_code` tool backed by the full tool registry SDK — and every assembled prompt section plus the ordinary workspace-instruction, skill-catalog, and runtime-context injections return;
 3. The phase derives from persisted session events, so resume / reload never lose state.
 
 Measured on native Windows (DeepSeek V4 Pro, max, V4.1b task): 98 / 99, mean 98.5, zero `let me` traces in the second run — reproducible, not a lucky draw, and no tool capability sacrificed. Original experiment: [xiaobright/dsh-anchored-standard](https://github.com/xiaobright/dsh-anchored-standard).
+
+Windows note: DSH's PTY backend is linux/darwin-only, so on win32 the persistent-shell group is disabled and phase-1 `bash` switches to `custom-bash` — the same name and Minimal-compatible schema, spawning Git Bash through the ordinary cross-platform subprocess seam (see `presets/liangshen/custom-bash.mjs`).
 
 ## Stabilization controls
 
@@ -21,9 +23,11 @@ The preset ships with extra safeguards on top of the reference mechanism, all co
 - `anchorGate` — after the first `tool/call`, the catalog stays two-tool until the first reasoning block classifies minimal-like, so a `Let me` first block does not immediately earn the full catalog;
 - `maxBootstrapSteps` — fallback promotion after N steps when no anchored block appeared;
 - `promoteAfterFirstResponse` — a tool-less first response promotes once it has responded; an anchor-gated session also releases when its first turn ends (`turn/end`), so the next user turn already sees the promoted catalog;
-- `promotedPresentation: code` — after promotion the wire is Code Mode (PTC): one `run_code` tool with the full registry available through the generated SDK, switched at the step boundary so the current step's native calls are never interrupted;
+- `promotedPresentation: code` — after promotion the wire is PTC Mode: one `run_code` tool with the full registry available through the generated SDK, switched at the step boundary so the current step's native calls are never interrupted;
 - `deferredSources` + `deferredGraceSteps` — workspace instructions and the skill catalog wait one extra step after promotion, so the tool-catalog switch and the injection shock do not land in the same step;
-- `bootstrapMaxTokens` — caps the phase-1 request output budget (community measurements put `max_tokens=1024` in the high-hit "We need" window, versus 0/5 at the 256k DSH default), and the cap is stripped again after promotion so `requestProposal` never solders 1024 into every later request.
+- `instructionHint` (on by default, issue #388) — the post-promotion full-text AGENTS.md injection is replaced by a single non-imperative hint naming the reference files and suggesting on-demand reads, so the injection never flips the anchored trajectory; the model still reaches the knowledge through read / skill_load. Set `false` to restore the legacy full-text injection;
+- `bootstrapMaxTokens` — caps the phase-1 request output budget (community measurements put `max_tokens=1024` in the high-hit "We need" window, versus 0/5 at the 256k DSH default), and the cap is stripped again after promotion so `requestProposal` never solders 1024 into every later request;
+- `phase1FirstCallInstruction` — an opt-in extra line appended to the phase-1 persona, off by default: test builds use it to ask the model to ground its first answer with one Minimal-native tool call before responding, so first-turn capability questions are answered from the promoted registry instead of the cropped two-tool view. It deviates from the byte-exact Minimal surface, which is why it ships unset.
 
 Plan mode is supported: phase 1 filters the assembled prompt sections down to the one-line `deployment:persona`, and promotion restores all sections and appends the session's working directory to the persona, so the agent knows its workspace and the plan-mode `plan:policy` section takes effect for every step after promotion.
 
@@ -68,6 +72,7 @@ node tools/analyze-session.mjs ~/.dsh/sessions/<workspace>/<session>/session.jso
 - Workspace instructions, the skill catalog, and the runtime snapshot stay out of phase 1; the snapshot returns with the catalog and the other two arrive one step later;
 - Phase-1 file tools inherit the host file sandbox (no bare `dsh-fs-local` filesystem);
 - The phase-1 persistent `bash` replaces the Standard ephemeral shell for the whole session (both tools register the name `bash`);
+- Phase 1 shows the two Minimal tools by design, so a first-turn capability question (for example "can you browse the web") can be answered from the cropped view and then corrected after promotion; the opt-in `phase1FirstCallInstruction` (see Stabilization controls) asks for a grounding tool call first, and otherwise task-style first turns avoid the mismatch;
 - The catalog changes exactly once, so a prefix-cache change happens between the first and second request;
 - The preset carries the same trust level as shell access — review `presets/liangshen/` before installing;
 - The plugin makes no network requests and adds no telemetry;

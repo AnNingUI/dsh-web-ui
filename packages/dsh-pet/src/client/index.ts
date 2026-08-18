@@ -11,7 +11,7 @@
  * @module @linxin666/dsh-pet/client
  */
 
-import type { ClientContext, SettingsScope, SettingsScopeSpec } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, ISessions, SessionId, SettingsScope, SettingsScopeSpec } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls the settings-surface Context merge (ctx.settingsScope).
@@ -26,7 +26,7 @@ import { createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { createPetStore, type PetStoreInstance } from './pet-store.ts'
 import { PetDockEntry, type PetInjected } from './PetDockEntry.tsx'
-import { PetSettingsCard, PetSettingsCardController, type PetSettings } from './PetSettingsCard.tsx'
+import { PetSettingsSection, PetSettingsCardController, type PetSettings } from './PetSettingsCard.tsx'
 import { NS, en, zh, t } from './locales.ts'
 
 /** The host pet API as the browser sees it (same-origin JSON endpoints). */
@@ -72,33 +72,16 @@ const POLL_MS = 2000
 /** Settings namespace the pet settings card edits (the Host plugin registers it). */
 const PET_SETTINGS_NS = 'pet'
 
-/** Required services. */
-export const inject = ['slots', 'locale', 'connection', 'settingsScope', 'remote']
+/** Required services (sessions powers bubble-to-session navigation). */
+export const inject = ['slots', 'locale', 'connection', 'settingsScope', 'remote', 'sessions']
 
 /** Re-exported for consumers that type against the injected face. */
 export type { PetInjected, PetDockEntryProps } from './PetDockEntry.tsx'
 export type { PetSpriteProps } from './PetSprite.tsx'
 export type { PetUiState, PetFeedback } from './pet-store.ts'
 export type { PetSettingsCardFace, PetSettingsCardState } from './PetSettingsCard.tsx'
+export type { PetSettingsSectionProps } from './PetSettingsCard.tsx'
 export type { PetDefinition } from '../registry.ts'
-
-declare module '@deepseek-ai/dsh-client-ui-slots' {
-  interface SlotMap {
-    /**
-     * The child slot the Web UI plugin group declares; this card registers
-     * into the group instead of the top-level 'settings.plugin.item' list.
-     * Spelled here with the same shape so this package can register without
-     * depending on the sibling UI package.
-     */
-    'web-ui.plugin.item': { kind: 'list'; scope: 'root'; owner: SettingsPluginItemOwnerProps }
-  }
-}
-
-/** Owner share of a plugin card (the group card supplies nothing). */
-export interface SettingsPluginItemOwnerProps {
-  /** Marker field: card owner props are intentionally empty. */
-  children?: never
-}
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -113,8 +96,8 @@ declare module '@deepseek-ai/cordis' {
 
 /**
  * Client plugin body: register dictionaries, mount the global pet entry and
- * poll loop while the plugin is enabled, and seat the settings card in the
- * Web UI plugin group.
+ * poll loop while the plugin is enabled, and seat the settings card as a
+ * first-level settings section.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
@@ -129,17 +112,24 @@ export function apply(ctx: ClientContext): void {
       : snapshot.status === 'unavailable'
   }
 
-  // Plugin configuration card: one staged form over the 'pet' settings
-  // namespace, contributed to the Web UI plugin group. The controller loads
+  // First-level settings section: one staged form over the 'pet' settings
+  // namespace, registered as a top-level settings page. The controller loads
   // the petId choices from the registry endpoint itself.
   const petSettings = new PetSettingsCardController(settingsScope)
-  ctx.slots.inject('web-ui.plugin.item', () => ctx.slots.register({
-    name: 'web-ui.plugin.item',
-    id: 'pet-settings',
-    order: 140,
-    locale: NS,
-    inject: () => petSettings.inject(),
-  }, PetSettingsCard))
+  ctx.slots.inject('settings.section', () => {
+    const unregister = ctx.slots.register({
+      name: 'settings.section',
+      id: 'pet',
+      order: 130,
+      label: () => ctx.locale.bind('pet')('settings.title'),
+      locale: 'pet',
+      inject: () => petSettings.inject(),
+    }, PetSettingsSection)
+    return () => {
+      petSettings.dispose()
+      unregister()
+    }
+  })
 
   // The global pet entry, its store, and the poll loop live while the plugin
   // is enabled; toggling the setting off hides the pet and stops polling.
@@ -162,6 +152,11 @@ export function apply(ctx: ClientContext): void {
       // tick tries again. After it lands, one list feeds both the sprite and
       // the settings card's choices.
       let petsLoaded = false
+      // Latest-wins guard: the 2s tick, visibility recovery, and
+      // interaction-triggered refreshes can overlap; only the newest
+      // response may publish, so a slow older one can never roll the
+      // snapshot back.
+      let stateSeq = 0
       const pollNow = (): void => {
         if (!petsLoaded) {
           petApi.pets().then((list) => {
@@ -171,9 +166,13 @@ export function apply(ctx: ClientContext): void {
             // Retry on the next poll tick.
           })
         }
+        const seq = stateSeq + 1
+        stateSeq = seq
         petApi.state().then((snapshot) => {
+          if (seq !== stateSeq) return
           setSnapshot(snapshot)
         }, () => {
+          if (seq !== stateSeq) return
           setState('error', 'pet.state transport error')
         })
       }
@@ -212,9 +211,23 @@ export function apply(ctx: ClientContext): void {
         }
       }, 'pet: poll')
 
+      // Clicking a session bubble jumps the GUI to that session. A bubble
+      // can outlive its disposed session by one poll tick, and the sessions
+      // service fails loud on unknown ids, so consult the live list first.
+      // The pet's type program also loads the host-side dsh-session package
+      // through the service types, whose Context merge declares a different
+      // 'sessions' face; pin the browser runtime's outward face here.
+      const sessions = ctx.sessions as unknown as ISessions
+      const openSession = (sessionId: string): void => {
+        const list = sessions.list.getSnapshot()
+        if (list.byId[sessionId as SessionId] === undefined) return
+        sessions.open(sessionId as SessionId)
+      }
+
       const injected = (): PetInjected => ({
         store: petStore,
         ensure: pollNow,
+        openSession,
         pet: () => {
           petApi.interact('pet').then((result) => {
             setFeedback({

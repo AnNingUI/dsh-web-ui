@@ -42,6 +42,23 @@ describe('extractWebSettingsNamespaces', () => {
     expect(extractWebSettingsNamespaces(text)).toEqual(['dsh-ssh'])
   })
 
+  it('reads a block list when the key line carries a trailing comment', () => {
+    const text = [
+      'web_settings_namespaces:  # expose only task-board',
+      '  - task-board',
+    ].join('\n')
+    expect(extractWebSettingsNamespaces(text)).toEqual(['task-board'])
+  })
+
+  it('reads an unindented block list (YAML allows column-0 sequence items)', () => {
+    const text = [
+      'web_settings_namespaces:',
+      '- dsh-ssh',
+      '- dsh-live-stats',
+    ].join('\n')
+    expect(extractWebSettingsNamespaces(text)).toEqual(['dsh-ssh', 'dsh-live-stats'])
+  })
+
   it('returns the empty list when the key is absent or the file is empty', () => {
     expect(extractWebSettingsNamespaces('llm:\n  provider: x\n')).toEqual([])
     expect(extractWebSettingsNamespaces('')).toEqual([])
@@ -58,11 +75,17 @@ describe('resolveNamespaceEntry', () => {
   it('passes bare family namespaces through', () => {
     expect(resolveNamespaceEntry('live-stats')).toBe('live-stats')
     expect(resolveNamespaceEntry('remote-web-ui')).toBe('remote-web-ui')
+    expect(resolveNamespaceEntry('community-plugins')).toBe('community-plugins')
+  })
+
+  it('maps the aionui-panel package names onto the panel settings namespace', () => {
+    expect(resolveNamespaceEntry('aionui-panel')).toBe('aionui-panel')
+    expect(resolveNamespaceEntry('dsh-aionui-panel')).toBe('aionui-panel')
+    expect(resolveNamespaceEntry('dsh-client-ui-aionui-panel')).toBe('aionui-panel')
   })
 
   it('ignores packages without a settings namespace and unknown names', () => {
     expect(resolveNamespaceEntry('dsh-web-ui')).toBeUndefined()
-    expect(resolveNamespaceEntry('dsh-client-ui-aionui-panel')).toBeUndefined()
     expect(resolveNamespaceEntry('dsh-client-ui-web-ui-settings')).toBeUndefined()
     expect(resolveNamespaceEntry('something-else')).toBeUndefined()
   })
@@ -76,11 +99,13 @@ describe('composeAllowlist', () => {
     'live-stats',
     'pet',
     'skin-background',
+    'community-plugins',
     'web-search-deepseek',
   ]
 
   it('falls back to the family list when the user configured none', () => {
     expect(composeAllowlist([], registered)).toEqual([
+      'community-plugins',
       'dsh-ssh',
       'live-stats',
       'pet',

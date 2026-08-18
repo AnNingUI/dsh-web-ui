@@ -16,6 +16,7 @@ import { randomBytes } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { SshEngine, ShellSession } from './engine.ts'
+import { isLoopbackRequest } from './loopback.ts'
 import { SSH_API, type HostPayload, type TerminalClientFrame, type TerminalServerFrame } from './protocol.ts'
 import type { HostStore } from './store.ts'
 
@@ -37,29 +38,6 @@ const BACKPRESSURE_HIGH_WATER = 1024 * 1024
 
 /** …and resume once it drains below this. */
 const BACKPRESSURE_LOW_WATER = 512 * 1024
-
-/** Loopback literal check plus browser same-origin markers (mirrors the pairing routes' fence). */
-function isLoopbackRequest(request: IncomingMessage): boolean {
-  const address = request.socket.remoteAddress
-  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
-  const host = request.headers.host
-  if (typeof host !== 'string') return false
-  let hostUrl: URL
-  try {
-    hostUrl = new URL(`http://${host}`)
-  } catch {
-    return false
-  }
-  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') return false
-  if (request.headers['sec-fetch-site'] === 'cross-site') return false
-  const origin = request.headers.origin
-  if (origin === undefined) return true
-  try {
-    return new URL(origin).host === hostUrl.host
-  } catch {
-    return false
-  }
-}
 
 /** One JSON response. */
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -100,6 +78,8 @@ export interface SshRoutesDeps {
   engine: SshEngine
   /** Temp dir for upload/download staging (tests inject a sandbox). */
   stagingDir?: string
+/** Upload byte cap override (tests); defaults to MAX_UPLOAD_BYTES. */
+maxUploadBytes?: number
 }
 
 /**
@@ -110,6 +90,7 @@ export interface SshRoutesDeps {
 export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: WebUpgradeRoute } {
   const { store, engine } = deps
   const staging = deps.stagingDir ?? join(tmpdir(), 'dsh-ssh-uploads')
+const maxUploadBytes = deps.maxUploadBytes ?? MAX_UPLOAD_BYTES
   // The upload route stages request bodies here; it must exist before the
   // first request (a missing dir would hang the first upload forever).
   mkdirSync(staging, { recursive: true })
@@ -176,6 +157,13 @@ export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: 
           }
           try {
             const entry = store.update(alias, body as unknown as Partial<HostPayload>)
+            // Connection-relevant changes invalidate the pooled connection:
+            // without this the pool would keep running commands on the old
+            // host/credentials until the idle sweep (up to 30 min later).
+            const patch = body as Record<string, unknown>
+            if (['host', 'port', 'user', 'auth', 'proxyJump'].some(key => patch[key] !== undefined)) {
+              engine.dropAlias(alias)
+            }
             writeJson(res, 200, { host: store.summarize(entry) })
           } catch (error) {
             writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
@@ -184,7 +172,7 @@ export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: 
         }
         if (method === 'DELETE') {
           try {
-            engine.stopAllTunnels(alias)
+            engine.dropAlias(alias)
             store.delete(alias)
             writeJson(res, 200, { ok: true })
           } catch (error) {
@@ -351,7 +339,7 @@ export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: 
           return
         }
         const declared = Number(req.headers['content-length'])
-        if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+        if (Number.isFinite(declared) && declared > maxUploadBytes) {
           writeJson(res, 413, { error: 'upload body too large' })
           return
         }
@@ -373,9 +361,22 @@ export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: 
           if (settled) return
           settled = true
           emit({ type: 'result', ok: false, error: error instanceof Error ? error.message : String(error) })
-          try { sink.destroy() } catch { /* closed */ }
-          void unlink(tmp).catch(() => undefined)
-          try { res.end() } catch { /* closed */ }
+          // End the response only after the tmp file is gone, and unlink only
+          // after the sink is fully closed: destroying a WriteStream whose
+          // fs.open is still pending lets the open RE-CREATE the file after
+          // an early unlink, leaving staging populated (this raced the
+          // response end and made the byte-cap test flaky).
+          const cleanup = (): void => {
+            void unlink(tmp).catch(() => undefined).finally(() => {
+              try { res.end() } catch { /* closed */ }
+            })
+          }
+          if (sink.destroyed) {
+            cleanup()
+          } else {
+            sink.once('close', cleanup)
+            try { sink.destroy() } catch { cleanup() }
+          }
         }
         const done = (): void => {
           if (settled) return
@@ -387,6 +388,24 @@ export function makeRoutes(deps: SshRoutesDeps): { routes: WebRoute[]; upgrade: 
         req.on('aborted', () => fail('upload aborted by the client'))
         res.on('error', () => fail('response stream closed'))
         res.on('close', () => { if (!res.writableEnded) fail('connection closed') })
+        // The content-length pre-check above can be bypassed by chunked or
+        // header-less requests: count the bytes as they actually arrive and
+        // abort the moment the cap is exceeded.
+        let received = 0
+        let capped = false
+        req.on('data', (chunk: Buffer) => {
+          received += chunk.byteLength
+          if (received > maxUploadBytes && !capped) {
+            capped = true
+            fail('upload body too large')
+            // Keep the socket alive until the response flush finishes:
+            // destroying the request here races res.end() and the client
+            // sees a hang-up instead of the result frame. Drain the rest of
+            // the body so the socket can close cleanly afterwards.
+            res.on('finish', () => { try { req.destroy() } catch { /* closed */ } })
+            req.resume()
+          }
+        })
         req.pipe(sink)
         sink.on('finish', async () => {
           if (settled) return

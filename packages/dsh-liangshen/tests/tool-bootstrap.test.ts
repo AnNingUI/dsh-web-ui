@@ -227,6 +227,68 @@ describe('anchored-tool-bootstrap', () => {
     expect(result.messages).toEqual(messages)
   })
 
+  test('instructionHint swaps the first post-promotion instructions dump for a hint (#388)', async () => {
+    const listeners = register({ instructionHint: true })
+    const preStepListener = listener(listeners, 'agent/pre-step')
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const sessionObj = { events: [{ type: 'tool/call' }] }
+    await assembleListener(undefined, { agent: { session: sessionObj } }, async () => ({
+      system: 'minimal persona',
+      tools: [{ name: 'bash' }, { name: 'read' }],
+    }))
+
+    const dump = {
+      id: 'instructions',
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<system-reminder>\n\nInstructions from: ~/.dsh/AGENTS.md\n\nGlobal rules.\n\nInstructions from: AGENTS.md\n\nRepo rules.\n</system-reminder>',
+      }],
+      source: { kind: 'agent-instructions' },
+    }
+    const messages = [message('user', 'user'), dump]
+    const first = await preStepListener(
+      { agent: { session: sessionObj }, messages, turn: 1, step: 1, signal: {} },
+      async () => ({ kind: 'enter', messages }),
+    )
+    expect(first.messages).toHaveLength(2)
+    expect(first.messages[0].id).toBe('user')
+    const hint = first.messages[1]
+    expect(hint.source.kind).toBe('instruction-hint')
+    expect(hint.content[0].text).toContain('Reference documents exist: ~/.dsh/AGENTS.md, AGENTS.md.')
+    expect(hint.content[0].text).toContain('not task instructions')
+    expect(hint.content[0].text).not.toContain('Global rules.')
+
+    // Later injections are dropped silently; the model reads on demand.
+    const second = await preStepListener(
+      { agent: { session: sessionObj }, messages, turn: 1, step: 2, signal: {} },
+      async () => ({ kind: 'enter', messages }),
+    )
+    expect(second.messages.map((entry: any) => entry.id)).toEqual(['user'])
+  })
+
+  test('instructionHint passes an instructions message with no file sections through', async () => {
+    const listeners = register({ instructionHint: true })
+    const preStepListener = listener(listeners, 'agent/pre-step')
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const sessionObj = { events: [{ type: 'tool/call' }] }
+    await assembleListener(undefined, { agent: { session: sessionObj } }, async () => ({
+      system: 'minimal persona',
+      tools: [{ name: 'bash' }, { name: 'read' }],
+    }))
+    const empty = {
+      id: 'instructions',
+      content: [{ type: 'text', text: '<system-reminder>\n\nNo workspace instructions.\n</system-reminder>' }],
+      source: { kind: 'agent-instructions' },
+    }
+    const messages = [message('user', 'user'), empty]
+    const result = await preStepListener(
+      { agent: { session: sessionObj }, messages, turn: 1, step: 1, signal: {} },
+      async () => ({ kind: 'enter', messages }),
+    )
+    expect(result.messages).toEqual(messages)
+  })
+
   test('phase 1 only lets explicit user messages through, whatever messageSources names', async () => {
     const preStepListener = listener(register({ messageSources: ['user', 'agent-instructions'] }), 'agent/pre-step')
     const messages = [
@@ -413,7 +475,7 @@ describe('anchored-tool-bootstrap', () => {
     expect(hasAnchoredReasoning(minimalThenStandard)).toBe(true)
   })
 
-  test('promotedPresentation switches to Code Mode once per session', async () => {
+  test('promotedPresentation switches to PTC Mode once per session', async () => {
     expect(inject).toContain('tools')
 
     const listeners = register({ promotedPresentation: 'code', anchorGate: true })
@@ -424,6 +486,23 @@ describe('anchored-tool-bootstrap', () => {
     const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
 
     await assembleListener(undefined, { agent }, async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }))
+    await assembleListener(undefined, { agent }, async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }))
+    expect(calls).toEqual(['code'])
+  })
+
+  test('promotedPresentation retries when the tools view arrives later', async () => {
+    const listeners = register({ promotedPresentation: 'code', anchorGate: true })
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const calls: string[] = []
+    const sessionObj = { events: [stepEvent(), reasoningEvent('We need inspect the repo.'), { type: 'tool/call' }] }
+    // No tools view yet: the switch must not latch.
+    const agent: { session: unknown; ctx: { tools?: { presentAs: (mode: string) => void } } } = { session: sessionObj, ctx: {} }
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
+
+    await assembleListener(undefined, { agent }, async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }))
+    expect(calls).toEqual([])
+
+    agent.ctx.tools = { presentAs: (mode: string) => { calls.push(mode) } }
     await assembleListener(undefined, { agent }, async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }))
     expect(calls).toEqual(['code'])
   })
@@ -455,10 +534,20 @@ describe('anchored-tool-bootstrap', () => {
     expect(() => register({ promotedPresentation: 'ptc' })).toThrow(/promotedPresentation/)
   })
 
-  test('misconfigured bootstrap catalogs fail loudly', async () => {
-    await expect(assemble(listener(register(), 'system-prompt/assemble'), [], [{ name: 'read' }, { name: 'edit' }])).rejects.toThrow(
-      /expected exactly one bootstrap shell/,
-    )
+  test('a missing bootstrap shell degrades to the full catalog instead of throwing', async () => {
+    const result = await assemble(listener(register(), 'system-prompt/assemble'), [], [
+      { name: 'read' },
+      { name: 'edit' },
+    ])
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['read', 'edit'])
+  })
+
+  test('a missing common tool degrades to the full catalog instead of throwing', async () => {
+    const result = await assemble(listener(register(), 'system-prompt/assemble'), [], [
+      { name: 'bash' },
+      { name: 'edit' },
+    ])
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['bash', 'edit'])
   })
 
   test('invalid stability config fails loudly', () => {
@@ -507,5 +596,167 @@ describe('anchored-tool-bootstrap', () => {
       async () => ({ provider: 'p', model: 'm', maxTokens: 384000 }),
     )
     expect(result.maxTokens).toBe(384000)
+  })
+
+  test('a compaction falls the session back to the controlled phase', async () => {
+    const listeners = register()
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const eventListener = listener(listeners, 'session/event')
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }, { name: 'write' }]
+    const events: unknown[] = [{ type: 'tool/call' }]
+    const sessionObj = { events, header: { cwd: '/workspace' } }
+
+    // Promoted before the compaction: the full catalog is exposed.
+    const promoted = await assembleListener(
+      undefined,
+      { agent: { session: sessionObj } },
+      async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }),
+    )
+    expect(promoted.tools).toEqual(tools)
+
+    // The compaction rewrites the surface; the next assembly is controlled
+    // again: bootstrap pair only, empty contexts, persona section only.
+    events.push({ type: 'compaction/end', seq: 10 })
+    await eventListener(sessionObj, { type: 'compaction/end', seq: 10 })
+    const after = await assembleListener(
+      undefined,
+      { agent: { session: sessionObj } },
+      async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS }),
+    )
+    expect(after.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read'])
+    expect(after.contexts).toEqual([])
+    expect(after.sections.map((section: any) => section.name)).toEqual(['deployment:persona'])
+  })
+
+  test('a cold session with a durable compaction boundary reconstructs the controlled phase', async () => {
+    // A fresh session object simulates a process restart: the full durable
+    // log is scanned from scratch, and the pre-boundary tool call must NOT
+    // re-promote the session.
+    const assembleListener = listener(register(), 'system-prompt/assemble')
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
+    const events = [
+      { type: 'tool/call' },
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } },
+      { type: 'compaction/end', seq: 10 },
+    ]
+    const result = await assemble(assembleListener, events, tools)
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read'])
+  })
+
+  test('a new tool call after the compaction boundary re-promotes', async () => {
+    const assembleListener = listener(register(), 'system-prompt/assemble')
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
+    const events = [
+      { type: 'tool/call' },
+      { type: 'compaction/end', seq: 10 },
+      { type: 'tool/call' },
+    ]
+    const result = await assemble(assembleListener, events, tools)
+    expect(result.tools).toEqual(tools)
+  })
+
+  test('the post-compaction controlled phase includes the compactionTools work set', async () => {
+    const listeners = register({ compactionTools: ['write', 'edit', 'todo_write'] })
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'write' }, { name: 'edit' }, { name: 'grep' }]
+    const events = [{ type: 'tool/call' }, { type: 'compaction/end', seq: 10 }]
+    const result = await assemble(assembleListener, events, tools)
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read', 'write', 'edit'])
+  })
+
+  test('compaction/end disposes the PTC Mode presentation and re-declares on re-promotion', async () => {
+    const listeners = register({ promotedPresentation: 'code', anchorGate: true })
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const eventListener = listener(listeners, 'session/event')
+    const modes: string[] = []
+    let disposed = 0
+    const sessionObj = {
+      events: [stepEvent(), reasoningEvent('We need inspect the repo.'), { type: 'tool/call' }],
+      header: { cwd: '/workspace' },
+    }
+    const agent = {
+      session: sessionObj,
+      ctx: { tools: { presentAs: (mode: string) => { modes.push(mode); return () => { disposed += 1 } } } },
+    }
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
+    const next = async () => ({ system: 'minimal persona', tools, contexts: [], sections: SECTIONS })
+
+    // Promoted: PTC Mode declared.
+    await assembleListener(undefined, { agent }, next)
+    expect(modes).toEqual(['code'])
+    expect(disposed).toBe(0)
+
+    // The compaction releases PTC Mode.
+    sessionObj.events.push({ type: 'compaction/end', seq: 10 })
+    await eventListener(sessionObj, { type: 'compaction/end', seq: 10 })
+    expect(disposed).toBe(1)
+
+    // Still controlled: the phase-1 catalog is back.
+    const after = await assembleListener(undefined, { agent }, next)
+    expect(after.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read'])
+
+    // A new anchor re-promotes and re-declares PTC Mode.
+    sessionObj.events.push(stepEvent(), reasoningEvent('We need inspect the repo again.'), { type: 'tool/call' })
+    await eventListener(sessionObj, { type: 'step/end' })
+    const rePromoted = await assembleListener(undefined, { agent }, next)
+    expect(rePromoted.tools).toEqual(tools)
+    expect(modes).toEqual(['code', 'code'])
+  })
+
+  test('invalid compactionTools values fail at apply time', () => {
+    expect(() => register({ compactionTools: [''] })).toThrow(/compactionTools/)
+    expect(() => register({ compactionTools: [42] as any })).toThrow(/compactionTools/)
+  })
+
+  test('phase1FirstCallInstruction appends to the phase-1 persona when set', async () => {
+    const instruction = 'Before answering, run pwd through the shell and base your answer on its result.'
+    const result = await assemble(
+      listener(register({ phase1FirstCallInstruction: instruction }), 'system-prompt/assemble'),
+      [],
+      [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }],
+    )
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read'])
+    expect(result.contexts).toEqual([])
+    expect(result.sections.map((section: any) => section.name)).toEqual(['deployment:persona'])
+    expect(result.sections[0].text).toBe(`${SECTIONS[0].text}${instruction}`)
+  })
+
+  test('an empty phase1FirstCallInstruction leaves the exact one-line persona', async () => {
+    const result = await assemble(
+      listener(register({ phase1FirstCallInstruction: '' }), 'system-prompt/assemble'),
+      [],
+      [{ name: 'bash' }, { name: 'read' }],
+    )
+    expect(result.sections[0].text).toBe(SECTIONS[0].text)
+  })
+
+  test('phase1FirstCallInstruction is not appended twice', async () => {
+    const instruction = 'Before answering, run pwd through the shell and base your answer on its result.'
+    const already = [{ name: 'deployment:persona', text: `${SECTIONS[0].text}${instruction}` }]
+    const result = await assemble(
+      listener(register({ phase1FirstCallInstruction: instruction }), 'system-prompt/assemble'),
+      [],
+      [{ name: 'bash' }, { name: 'read' }],
+      undefined,
+      already,
+    )
+    expect(result.sections[0].text).toBe(`${SECTIONS[0].text}${instruction}`)
+  })
+
+  test('phase1FirstCallInstruction does not leak into the promoted assembly', async () => {
+    const instruction = 'Before answering, run pwd through the shell and base your answer on its result.'
+    const result = await assemble(
+      listener(register({ phase1FirstCallInstruction: instruction }), 'system-prompt/assemble'),
+      [{ type: 'tool/call' }],
+      [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }],
+    )
+    expect(result.tools.map((tool: any) => tool.name)).toEqual(['bash', 'read', 'edit'])
+    expect(result.sections[0].text).toBe(`${SECTIONS[0].text}\n\nYour working directory is /workspace.`)
+    expect(result.sections[0].text).not.toContain(instruction)
+  })
+
+  test('invalid phase1FirstCallInstruction values fail at apply time', () => {
+    expect(() => register({ phase1FirstCallInstruction: 42 as any })).toThrow(/phase1FirstCallInstruction/)
+    expect(() => register({ phase1FirstCallInstruction: {} as any })).toThrow(/phase1FirstCallInstruction/)
   })
 })

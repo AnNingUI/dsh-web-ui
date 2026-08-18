@@ -9,10 +9,19 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
+import { CodeBlock } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PreviewTabState } from '../store.ts'
 import { useResizableSplit } from '../hooks/useResizableSplit.ts'
 import { t } from '../locales.ts'
 import { renderMarkdown, resolveMarkdownImage } from './markdown.ts'
+import {
+  DATA_MD_SCOPE,
+  enhanceMermaidBlocks,
+  mermaidTheme,
+  rethemeMermaidBlocks,
+  shellIsDark,
+  watchShellTheme,
+} from './mermaid.ts'
 import previewCss from '../styles/preview.module.css'
 
 /** Split-ratio persistence key (AionUi contract). */
@@ -33,9 +42,10 @@ export function TabContent({
   onSave: () => void
 }): JSX.Element {
   if (tab.error !== null) {
+    const message = tab.error === 'write-conflict' ? t('preview.saveConflict') : tab.error
     return <div className={previewCss.placeholder}>
       <div className={previewCss.placeholderTitle}>{tab.title}</div>
-      <div className={previewCss.placeholderError}>{tab.error}</div>
+      <div className={previewCss.placeholderError}>{message}</div>
     </div>
   }
 
@@ -148,7 +158,7 @@ function SplitPane({
           {tab.contentType === 'markdown' && <MarkdownViewer content={content} root={tab.root} path={tab.path} />}
           {tab.contentType === 'html' && <HtmlViewer content={content} />}
           {tab.contentType === 'csv' && <CsvViewer content={content} />}
-          {tab.contentType === 'code' && <CodeViewer content={content} language={tab.title.split('.').pop() ?? ''} />}
+          {(tab.contentType === 'code' || tab.contentType === 'text') && <CodeViewer content={content} language={tab.title.split('.').pop() ?? ''} />}
         </div>
       </div>
     </div>
@@ -196,7 +206,33 @@ function MarkdownViewer({
       </div>
     )
   }
-  return <div className={previewCss.mdViewer} dangerouslySetInnerHTML={{ __html: html }} />
+  return <MermaidAwareMarkdown html={html} />
+}
+
+/**
+ * Rendered markdown body plus the mermaid enhancement lifecycle: fresh
+ * blocks render once per html, completed diagrams re-render on shell theme
+ * flips. The scope marker lets the chat-transcript enhancer skip this
+ * subtree (each surface owns its blocks).
+ */
+function MermaidAwareMarkdown({ html }: { html: string }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (el === null) return undefined
+    void enhanceMermaidBlocks(el, { className: previewCss.mermaidBlock, theme: mermaidTheme(shellIsDark()) })
+    return watchShellTheme((isDark) => {
+      void rethemeMermaidBlocks(el, { theme: mermaidTheme(isDark) })
+    })
+  }, [html])
+  return (
+    <div
+      ref={ref}
+      className={previewCss.mdViewer}
+      {...{ [DATA_MD_SCOPE]: '1' }}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  )
 }
 
 /** HTML viewer: sandboxed iframe (scripts off) or source textarea. */
@@ -228,10 +264,9 @@ function HtmlViewer({
   return <iframe className={previewCss.pdfViewer} srcDoc={srcDoc} sandbox="" title="html preview" />
 }
 
-/** Plain code/text viewer. */
-function CodeViewer({ content, language }: { content: string; language: string }): JSX.Element {
-  void language
-  return <pre className={previewCss.codeViewer}><code>{content}</code></pre>
+/** Syntax-highlighted code/text viewer (official shiki core via CodeBlock). */
+export function CodeViewer({ content, language }: { content: string; language: string }): JSX.Element {
+  return <CodeBlock code={content} lang={language === '' ? undefined : language} className={previewCss.codeViewer} copyLabel={t('preview.copyCode')} copiedLabel={t('preview.copyCodeDone')} />
 }
 
 /**

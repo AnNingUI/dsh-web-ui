@@ -40,13 +40,14 @@ packages/<name>/
 - `patchFrom`：该包的 `cordis.patch.yml` insert 行会被汇总进聚合包 patch；
 - `deps`：解析为包名写入聚合包 `package.json` 的 `dependencies`（`workspace:*`）。
 
-皮肤（新增或改动）不需要进任何 aggregate.yml：`packages/dsh-skins/build.mjs` 会把 `packages/skins/<id>` 的 `skin.json` + `lib/client.js` 复制进 `dsh-skins/skins/<id>`（npm 上皮肤资产全部内置在 dsh-skins 一个包里，避免为每个皮肤包名付 npm 新包名费用）。改完皮肤后运行 `pnpm --filter @linxin666/dsh-skins build`。皮肤启用互斥由 `dsh-skin use` 管理（`~/.dsh/cordis.patch.yml` managed 区段）。
+皮肤（新增或改动）不需要进任何 aggregate.yml：`packages/dsh-skins/build.mjs` 会把 `packages/skins/<id>` 的 `skin.json` + `lib/client.js` 复制进 `dsh-skins/skins/<id>`（npm 上皮肤资产全部内置在 dsh-skins 一个包里，避免为每个皮肤包名付 npm 新包名费用）。改完皮肤后运行 `pnpm --filter @linxin666/dsh-skins build`。皮肤启用互斥由 `dsh-skin use` 管理（当前 Web profile 的 `<harness-home>/profiles/<profile>/cordis.patch.yml` managed 区段）。
 
 ### 4. 重新生成聚合包
 
 ```sh
 node scripts/aggregate.mjs          # 重新生成聚合包 cordis.patch.yml + 依赖
-node scripts/aggregate.mjs --check  # 校验模式：任何漂移以退出码 1 报错（CI 用）
+聚合行 id 自动加 `web-ui-` 前缀，可与独立包共存；规则见 packages/AGENTS.md。
+node scripts/aggregate.mjs --check  # 校验模式：漂移即失败（CI 用）
 ```
 
 ### 5. 构建验证
@@ -101,10 +102,10 @@ dsh plugin --profile web add link:<dsh-web-ui>/packages/dsh-web-ui-all
 
 ### 社区插件索引登记
 
-第三方插件作者可把自己的插件登记进「社区插件」卡片（设置 → 插件配置 → Web UI 插件），卡片列出条目并链接到作者自己的仓库：
+第三方插件作者可把自己的插件登记进「社区插件」一级菜单项（设置 → 社区插件），页面直接展开列出条目并链接到作者自己的仓库：
 
-1. 在 `packages/dsh-web-ui-settings/community.json` 追加条目：`id` / `name` / `nameEn` / `author` / `repo`（https:// 仓库 URL）必填，`description` / `descriptionEn` / `npm` 可选；
-2. 运行 `node scripts/community-index` 重新生成注册表并提交生成的 `packages/dsh-web-ui-settings/src/client/generated/community.ts`；
+1. 在 `packages/dsh-community-plugins/community.json` 追加条目：`id` / `name` / `nameEn` / `author` / `repo`（https:// 仓库 URL）必填，`description` / `descriptionEn` / `npm` 可选；
+2. 运行 `node scripts/community-index` 重新生成注册表并提交生成的 `packages/dsh-community-plugins/src/client/generated/community.ts`；
 3. `pnpm community:check` 校验数据与生成物一致（CI 门禁）。
 
 索引只收录链接、不搬代码，条目版权归原作者，由维护者审核合并。
@@ -121,7 +122,7 @@ dsh plugin --profile web add link:<dsh-web-ui>/packages/dsh-web-ui-all
 ```
 
 - **类型来源（只能基于官方 NPM SDK）**：各包把用到的 `@deepseek-ai/*` 包声明为 `devDependencies`
-  （`^0.1.0-rc.6`；cordis 用 `^4.0.1`），TS 从 node_modules 自动解析类型
+  （`^0.1.0-rc.7`；cordis 用 `^4.0.1`），TS 从 node_modules 自动解析类型
   （SDK 包的 `exports["."].types` 统一指向 `lib/types/index.d.ts`，client 半区子路径
   `./client` 同理）。**禁止** tsconfig `extends` / `paths` / `references` 指向任何 DSH 源码
   checkout（历史形态：`../../../test-zhu1090093659` 相对路径、`~/.dsh/source/current` 绝对
@@ -141,10 +142,9 @@ dsh plugin --profile web add link:<dsh-web-ui>/packages/dsh-web-ui-all
   处理 CSS）；client 半区闭包工厂在测试中不可直接 import——用 `vitest.setup.ts` 的最小
   `__ModuleLoader__` stub（`packages/dsh-live-stats/vitest.setup.ts`）或 `vi.mock` 替换
   （`packages/dsh-remote-web-ui/tests/remote-entry.spec.tsx` 的 `createSnapshotStore` mock）。
-- **设置页插件配置（20260811+ 可选能力）**：DSH web 设置的「插件配置」区（`ui-plugin-config` 注册的 `settings.section`）展示每插件一张卡片（`settings.plugin.item` 槽）。全家桶插件先由 `dsh-web-ui-settings` 的父卡（`settings.plugin.item`）声明 `web-ui.plugin.item` 子槽，各功能插件把卡片注册进子槽，从而在设置页收拢为一张「Web UI 插件」卡，内含各插件的启用开关与配置表单。插件接入只需两步：
+- **设置页插件配置（20260811+ 可选能力）**：DSH web 设置的「插件配置」区展示每插件一张卡片（`settings.plugin.item` 槽）。Web UI 插件组、皮肤中心、社区插件、桌面宠物各注册一级设置分区（`settings.section`，`label` 用 thunk 跟随语言，内容直接展开）；Web UI 插件组声明 `web-ui.plugin.item` 子槽归组 task-board 等卡片。插件接入只需两步：
   1. **host 半区**：`installSettingsSection(ctx, settingsNamespace('<ns>'), <z-schema>, <composition entry>, { setSource, onChange })`（`@deepseek-ai/dsh-settings`）注册命名空间；`setSource` 注入动态读取器，`onChange` 让已派生的行为跟随已提交的修改，无需重启。
-  2. **browser 半区**：注入 `settingsScope`（`@deepseek-ai/dsh-client-ui-settings` 提供 `ctx.settingsScope`；`bind()` 还要求调用方注入 `connection` 与 `remote`），`ctx.settingsScope.bind({ namespace })` 读写该命名空间，并注册 `web-ui.plugin.item` 卡片（自行 `declare module '@deepseek-ai/dsh-client-ui-slots'` 声明该槽，shape 与 `ui-plugin-config` 一致；slot `order` 用 100+ 避开内置卡片）。样板实现见 `packages/dsh-remote-web-ui`（`src/client/settings-form.ts` + `PluginSettingsCard.tsx` + `*SettingsCard.tsx`，自包含的 staged 表单，不依赖兄弟 UI 包）。
-- **皮肤类插件**：改用 `scripts/dsh-skin-new` 脚手架（皮肤规范见 skin-center / 各皮肤包 README），不经过本流程第 3-4 步的 `dsh-web-ui-all` 注册。皮肤中心（skin-center）虽是皮肤聚合，其 GUI 卡片与功能插件一样注册进 `web-ui.plugin.item` 组（设置 → 插件配置 → Web UI 插件），不占设置页一级分区。
-## 移植 harness 插件的挂载约束
+  2. **browser 半区**：注入 `settingsScope`（`@deepseek-ai/dsh-client-ui-settings` 提供 `ctx.settingsScope`；`bind()` 还要求注入 `connection` 与 `remote`），`ctx.settingsScope.bind({ namespace })` 读写该命名空间，并注册卡片：归组用 `web-ui.plugin.item`，插件配置页用 `settings.plugin.item`，一级菜单用 `settings.section`（自行 `declare module '@deepseek-ai/dsh-client-ui-slots'` 声明该槽，shape 与官方一致；`order` 用 100+；一级分区卡片加 `alwaysOpen` 直接展开）。样板见 `packages/dsh-remote-web-ui`（自包含 staged 表单，不依赖兄弟 UI 包）。
+- **皮肤类插件**：改用 `scripts/dsh-skin-new` 脚手架（皮肤规范见 skin-center / 各皮肤包 README），不经过本流程第 3-4 步的 `dsh-web-ui-all` 注册。皮肤中心（skin-center）虽是皮肤聚合，其 GUI 是一级设置分区（设置 → 皮肤中心），自带启用开关。## 移植 harness 插件的挂载约束
 
 聚合包 insert 行不带 `config`，loader 调 `apply` 前会用插件 schema 默认值填充配置；`apply` 若无条件加载时校验会把填充后的空配置当配置而抛错，profile 加载失败。应改为：组合条目配置了关键字段才在加载时校验，否则调用时提示「未配置」（settings section 提交仍严格校验）。参考 `packages/dsh-tool-describe-image`。

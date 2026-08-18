@@ -7,7 +7,7 @@
  * Keyboard activation needs no synthetic test: the trigger is a native
  * <button type="button">, so Enter/Space activation is browser behavior.
  */
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { findImageReferences, installConversationImagePreview, type ConversationImagePreview } from '../src/client/preview.ts'
 
 /** The reference the send hook splices into a plain-text prompt. */
@@ -23,6 +23,16 @@ const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0)
 describe('findImageReferences', () => {
   it('locates a single reference with its alt text and span', () => {
     expect(findImageReferences(`看 ${REF} 一下`)).toEqual([{ alt: '图片', path: PATH, start: 2, end: 2 + REF.length }])
+  })
+
+  it('preserves durable reference metadata in the preview path', () => {
+    const durable = `![图片](${PATH}?ref=%7B%22attachmentId%22%3A%22sha256%3Aabc%22%7D)`
+    expect(findImageReferences(durable)).toEqual([{
+      alt: '图片',
+      path: `${PATH}?ref=%7B%22attachmentId%22%3A%22sha256%3Aabc%22%7D`,
+      start: 0,
+      end: durable.length,
+    }])
   })
 
   it('locates repeated references in one chunk', () => {
@@ -149,6 +159,35 @@ describe('installConversationImagePreview (fixed root)', () => {
     overlay.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     expect(document.body.querySelector('[data-dsh-di-lightbox]')).toBeNull()
     expect(document.activeElement).toBe(button)
+  })
+
+  it('restores focus without scrolling the trigger back into view (issue #317)', () => {
+    const root = makeRoot(`<div class="bubble">${REF}</div>`)
+    handle = installConversationImagePreview(() => true, root)
+    const button = root.querySelector('button')!
+    const focus = vi.spyOn(button, 'focus')
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    const overlay = document.body.querySelector('[data-dsh-di-lightbox]') as HTMLElement
+    overlay.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true })
+  })
+
+  it('open/close cycles are idempotent: one overlay at a time, none after, transcript untouched', () => {
+    const root = makeRoot(`<div class="bubble">看 ${REF} 一下</div>`)
+    handle = installConversationImagePreview(() => true, root)
+    const button = root.querySelector('button')!
+    const snapshot = root.innerHTML
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      const overlays = document.body.querySelectorAll('[data-dsh-di-lightbox]')
+      expect(overlays).toHaveLength(1)
+      const overlay = overlays[0] as HTMLElement
+      overlay.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      expect(document.body.querySelectorAll('[data-dsh-di-lightbox]')).toHaveLength(0)
+      expect(root.querySelectorAll('img')).toHaveLength(1)
+      expect(root.querySelector('img')?.src).toBe(`${window.location.origin}${PATH}`)
+    }
+    expect(root.innerHTML).toBe(snapshot)
   })
 
   it('dispose restores every preview and stops observing', async () => {

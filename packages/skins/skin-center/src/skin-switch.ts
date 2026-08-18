@@ -4,11 +4,12 @@
  * `dsh-skin` binary on PATH (the bug zhu1090093659/dsh-web-ui#5: "dsh-skin
  * CLI not found on PATH").
  *
- * `use` owns the `dsh-skin managed` section of the harness-home
+ * `use` owns the `dsh-skin managed` section of the active profile's
  * `cordis.patch.yml` (atomic rewrite, hot-reloaded by the DSH config watcher
  * within seconds, no restart) and the profile node_modules symlink that makes
  * the selected skin resolvable from the running profile. `current` reads the
- * active back.
+ * active state back. Keeping the patch profile-scoped prevents non-Web
+ * profiles such as dsh-tui from trying to resolve browser-only skin packages.
  *
  * The behaviour/text is a 1:1 port of scripts/dsh-skin (`use`/`current`;
  * workspace assets live in packages/skins/<id>). The skin registry is
@@ -427,16 +428,74 @@ export function wiredNames(registry: Record<string, SkinSwitchEntry>): Set<strin
 
 /**
  * Drop legacy hand-written skin rows (insert rows with a name) and old touch
- * comments. The CLI regex matched the historical @deepseek-ai scope; this
- * also matches the current @linxin666 scope so stale rows are always cleaned.
+ * comments. Historical writers emitted a comment line above the row with
+ * either npm scope, but the row must go regardless of the comment line,
+ * indentation or scope — any leftover insert row for a ui-skin-* id plus the
+ * managed section's own row produces two insert rows for one loader id, and
+ * the boot fails with "duplicate loader entry id" (issue #267). Id-target
+ * rows (`- id: ui-skin-xp` + `disabled: true`) carry no `name:` line and
+ * must survive: they are the mutual-exclusion wiring, not inserts.
  * @param patch - raw patch file text.
  */
 export function stripLegacySkinRows(patch: string): string {
-  return patch
-    // insert rows for any ui-skin-* package, with their optional comment line
-    .replace(/^    # [^\n]*\n    - id: ui-skin-[^\n]+\n      name: '@(?:deepseek-ai|linxin666)\/dsh-client-ui-skin-[^\n]+'\n/gm, '')
-    .replace(/^# \(touch\)[^\n]*\n?/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
+  const lines = patch.split(/\r?\n/)
+  const kept: string[] = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    const idMatch = /^\s*- id:\s*(ui-skin-[a-z0-9-]+)\s*$/.exec(line)
+    if (idMatch !== null) {
+      const next = lines[i + 1]
+      // An insert row carries a `name:` line right below it.
+      const insertName = next === undefined
+        ? null
+        : /^\s*name:\s*['"]?@[a-z0-9][a-z0-9._-]*\/dsh-client-ui-skin-[^'"]*['"]?\s*$/.exec(next)
+      if (insertName !== null) {
+        // Drop an immediately preceding comment line too (legacy writers
+        // emitted one; the row must go even when they did not).
+        if (i > 0 && /^\s*#[^\n]*$/.test(lines[i - 1]) && kept[kept.length - 1] === lines[i - 1]) kept.pop()
+        i += 1 // skip the name line; the loop increment skips the id line
+        continue
+      }
+    }
+    kept.push(line)
+  }
+  let text = kept.join('\n').replace(/^# \(touch\)[^\n]*\n?/gm, '')
+  text = dropEmptyInserts(text)
+  return text.replace(/\n{3,}/g, '\n\n')
+}
+
+/** Remove `- insert:` items left with no `- id:` rows after legacy cleanup,
+ * so an emptied block cannot perturb the loader or later renders. Blocks that
+ * still carry rows (any plugin id, skin or not) are kept byte-for-byte. */
+function dropEmptyInserts(text: string): string {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (/^-\s*insert:\s*$/.exec(trimmed) === null) {
+      out.push(line)
+      i += 1
+      continue
+    }
+    const indent = line.length - trimmed.length
+    let j = i + 1
+    let hasRow = false
+    while (j < lines.length) {
+      const t = lines[j].trim()
+      if (t === '') { j += 1; continue }
+      const ind = lines[j].length - t.length
+      if (ind <= indent) break
+      if (!t.startsWith('#') && /^- id:/.test(t)) hasRow = true
+      j += 1
+    }
+    if (hasRow) {
+      for (let k = i; k < j; k += 1) out.push(lines[k])
+    }
+    i = j
+  }
+  return out.join('\n')
 }
 
 /**
@@ -452,6 +511,75 @@ export function stripManaged(patch: string): string {
   return patch.slice(0, start) + patch.slice(end + MANAGED_END.length)
 }
 
+/**
+ * Drop bare top-level empty flow lists (`[]`) left by the stock profile
+ * template. The managed skin section below provides the actual patch array,
+ * and an empty flow list followed by block entries is not parseable YAML
+ * ("end of the stream or a document separator is expected"), which breaks the
+ * next dsh boot. Nested `list: []` mapping values are untouched (the line
+ * does not match a standalone `[]`). Runs before
+ * normalizePatchForManagedAppend so a template `[]` sitting above the
+ * user's own block rows is removed instead of failing that stricter check.
+ * @param patch - raw patch file text.
+ */
+export function stripEmptyPatchList(patch: string): string {
+  return patch.replace(/^[ \t]*\[\s*\][ \t]*\r?\n?/gm, '')
+}
+
+/**
+ * Prepare a user patch for appending the managed block sequence. DSH creates
+ * new profile overlays with a flow-style empty sequence (`[]`); appending
+ * block rows after that root would create a second YAML root and break boot.
+ * Existing block sequences and comments are preserved byte-for-byte.
+ * @param patch - raw patch text after old managed rows were removed.
+ */
+export function normalizePatchForManagedAppend(patch: string): string {
+  const lines = (patch.match(/[^\r\n]*(?:\r\n|\n|$)/g) ?? []).filter(line => line !== '')
+  const significant: Array<{ index: number; text: string; indent: number }> = []
+  let sawDocumentStart = false
+  for (let index = 0; index < lines.length; index += 1) {
+    const body = lines[index].replace(/\r?\n$/, '')
+    const text = body.trim()
+    if (text === '' || text.startsWith('#')) continue
+    if (/^---(?:\s+#.*)?$/.test(text)) {
+      if (sawDocumentStart || significant.length > 0) {
+        throw new Error('cordis.patch.yml must contain one YAML document before dsh-skin can append its managed section')
+      }
+      sawDocumentStart = true
+      continue
+    }
+    if (/^\.\.\.(?:\s+#.*)?$/.test(text)) {
+      throw new Error('cordis.patch.yml document-end markers are not supported before the dsh-skin managed section')
+    }
+    significant.push({ index, text, indent: body.length - body.trimStart().length })
+  }
+  if (significant.length === 0) return patch
+  const root = significant[0]
+  if (/^\[\]\s*(?:#.*)?$/.test(root.text)) {
+    if (significant.length !== 1) {
+      throw new Error('cordis.patch.yml must contain one top-level sequence before dsh-skin can append its managed section')
+    }
+    lines.splice(root.index, 1)
+    return lines.join('')
+  }
+  if (!root.text.startsWith('-')) {
+    throw new Error('cordis.patch.yml must use a top-level block sequence before dsh-skin can append its managed section')
+  }
+  for (const entry of significant.slice(1)) {
+    if (entry.indent < root.indent || (entry.indent === root.indent && !entry.text.startsWith('-'))) {
+      throw new Error('cordis.patch.yml must contain one top-level block sequence before dsh-skin can append its managed section')
+    }
+  }
+  return patch
+}
+
+/** Render one managed block after the user patch using its existing line ending. */
+export function appendManagedPatch(patch: string, managed: string): string {
+  const eol = patch.includes('\r\n') ? '\r\n' : '\n'
+  const base = patch.replace(/\s+$/, '')
+  const block = managed.replace(/\n/g, eol)
+  return `${base}${base === '' ? '' : eol + eol}${block}${eol}`
+}
 /** YAML single-quoted scalar: a literal single quote doubles. `wiring.id` is
  * already validated before it ever reaches a registry, so only `package`
  * needs escaping here. */
@@ -504,14 +632,18 @@ export function currentActive(patch: string, registry: Record<string, SkinSwitch
 }
 
 /**
- * Whether a cordis.patch.yml text contains an `insert:` list row for `id`
- * (the row a skin bundle would contribute, as opposed to a home-layer
- * `disabled: true` id-target row). The patch format is small and line-based;
- * a YAML parser dependency is not worth the weight for this one probe.
+ * Count the `insert:` list rows for a loader entry id in a patch text (the
+ * rows a skin bundle would contribute, as opposed to home-layer
+ * `disabled: true` id-target rows). The patch format is small and
+ * line-based; a YAML parser dependency is not worth the weight for this one
+ * probe. Two insert rows for one id fail the boot with "duplicate loader
+ * entry id" (issue #267), so the count is what the self-heal in useSkin
+ * keys on.
  * @param patch - raw patch text.
  * @param id - the loader entry id to look for.
  */
-function patchHasInsertId(patch: string, id: string): boolean {
+function countInsertId(patch: string, id: string): number {
+  let count = 0
   let insertIndent: number | null = null
   for (const line of patch.split(/\r?\n/)) {
     const trimmed = line.trimStart()
@@ -532,9 +664,14 @@ function patchHasInsertId(patch: string, id: string): boolean {
       continue
     }
     const row = /^- id:\s*['"]?([^'"]+)['"]?\s*$/.exec(trimmed)
-    if (row !== null && row[1] === id) return true
+    if (row !== null && row[1] === id) count += 1
   }
-  return false
+  return count
+}
+
+/** Whether a patch contains at least one insert row for `id` (see countInsertId). */
+function patchHasInsertId(patch: string, id: string): boolean {
+  return countInsertId(patch, id) > 0
 }
 
 /**
@@ -715,8 +852,10 @@ function registryWithProfileWiring(registry: Record<string, SkinSwitchEntry>, pr
 
 /** Layout of the DSH home + profile the CLI switches against. */
 export interface SkinSwitchPaths {
-  /** ~/.dsh/cordis.patch.yml */
+  /** ~/.dsh/profiles/<profile>/cordis.patch.yml */
   patchPath: string
+  /** ~/.dsh/cordis.patch.yml (pre-profile-scope migration source). */
+  legacyPatchPath: string
   /** ~/.dsh/profiles/<profile>/node_modules */
   profileModulesDir: string
   /** ~/.dsh/profiles/<profile>/package.json (dsh.profile.bundles wiring). */
@@ -881,7 +1020,8 @@ export function resolvePaths(home?: string, profile?: string, fromUrl: string = 
   const explicit = firstNonBlank(profile, process.env.DSH_SKIN_PROFILE, process.env.DSH_PROFILE)
   const activeProfile = explicit ?? profileFromCwd(process.cwd(), profilesRoot) ?? install?.profile ?? 'web'
   return {
-    patchPath: joinPath(harnessHome, 'cordis.patch.yml'),
+    patchPath: joinPath(harnessHome, 'profiles', activeProfile, 'cordis.patch.yml'),
+    legacyPatchPath: joinPath(harnessHome, 'cordis.patch.yml'),
     profileModulesDir: joinPath(harnessHome, 'profiles', activeProfile, 'node_modules'),
     profileManifestPath: joinPath(harnessHome, 'profiles', activeProfile, 'package.json'),
     profilePatchPath: joinPath(harnessHome, 'profiles', activeProfile, 'cordis.patch.yml'),
@@ -1141,14 +1281,39 @@ export function useSkin(name: string, opts: { home?: string; profile?: string; r
     renderRegistry = registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath, paths.profilePatchPath)
   }
 
-  const patch = stripLegacySkinRows(stripManaged(readPatch(paths.patchPath)))
-  const next = `${patch.replace(/\s+$/, '')}\n\n${renderManaged(official ? null : name, renderRegistry)}\n`
+  // Older releases wrote the managed block at harness-home scope, which
+  // makes every profile inherit the Web-only skin insert. Remove that block
+  // before writing the active profile so a later dsh-tui boot cannot import a
+  // package installed only in the Web profile (issue #290).
+  const legacyPatch = readPatch(paths.legacyPatchPath)
+  const migratedLegacyPatch = stripLegacySkinRows(stripManaged(legacyPatch))
+  if (migratedLegacyPatch !== legacyPatch) {
+    writePatchAtomic(paths.legacyPatchPath, migratedLegacyPatch)
+  }
+
+  const patch = normalizePatchForManagedAppend(stripEmptyPatchList(stripLegacySkinRows(stripManaged(readPatch(paths.patchPath)))))
+  let next = appendManagedPatch(patch, renderManaged(official ? null : name, renderRegistry))
+  let skippedInsert = false
+  if (!official && countInsertId(next, renderRegistry[name].id) > 1) {
+    // Another insert row for the same loader id already exists elsewhere in
+    // the patch — a profile-wired skin bundle the wiring probe missed, or a
+    // leftover row the legacy cleanup could not match. Two insert rows for
+    // one id fail the boot with "duplicate loader entry id" (issue #267), so
+    // drop OUR row and keep the pre-existing one: the managed section then
+    // only carries the mutual-exclusion disabled rows.
+    const wired = { ...renderRegistry, [name]: { ...renderRegistry[name], bundleWired: true } }
+    next = appendManagedPatch(patch, renderManaged(name, wired))
+    skippedInsert = true
+  }
   writePatchAtomic(paths.patchPath, next)
 
   const core = official
     ? 'restored the official stock look — the config watcher applies it within seconds; refresh the page to see it.'
     : `skin switched to "${name}" — the config watcher applies it within seconds; refresh the page (or the manifest re-fetches) to see it.`
-  return core
+  const notice = skippedInsert
+    ? ' （检测到补丁中已有该皮肤的 insert 行，已跳过本层 insert，避免 duplicate loader entry id。）'
+    : ''
+  return core + notice
 }
 
 /**
@@ -1165,5 +1330,12 @@ export function currentSkin(patch: string | undefined, opts: { home?: string; pr
   // Mirror useSkin's wiring view: an installed per-skin bundle provides its
   // own insert row, so the home patch carries only disabled rows for it and
   // currentActive must treat it as bundle-wired to report it as active.
-  return currentActive(patch ?? readPatch(paths.patchPath), registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath, paths.profilePatchPath)) ?? 'none'
+  let activePatch = patch ?? readPatch(paths.patchPath)
+  // Report the pre-migration state until the first switch moves it into the
+  // active profile. An explicit patch argument remains authoritative in tests
+  // and for callers that already read the target file.
+  if (patch === undefined && !activePatch.includes(MANAGED_START)) {
+    activePatch = readPatch(paths.legacyPatchPath)
+  }
+  return currentActive(activePatch, registryWithProfileWiring(registry, paths.profileModulesDir, paths.profileManifestPath, paths.profilePatchPath)) ?? 'none'
 }

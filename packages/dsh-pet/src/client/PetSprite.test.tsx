@@ -5,7 +5,7 @@
  * selection) as composition input, never as submit/cancel (issue #89).
  */
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { PetSprite, type PetSpriteProps } from './PetSprite.tsx'
 import { t } from './locales.ts'
 import type { PetStateView } from '../service.ts'
@@ -27,6 +27,7 @@ function petDefinition(): PetDefinition {
     cell: { width: 192, height: 208 },
     columns: 8,
     rows: [6, 8, 8, 4, 5, 8, 6, 6, 6],
+    atlasRows: 9,
     tracks: {
       idle: track([0, 1, 2, 3, 4, 5], [400, 400, 400, 400, 400, 400]),
       'running-right': track([0, 1, 2, 3, 4, 5, 6, 7], [225, 225, 225, 225, 225, 225, 225, 225]),
@@ -86,11 +87,16 @@ beforeAll(() => {
 
 afterEach(() => {
   cleanup()
+  vi.restoreAllMocks()
 })
 
-/** Render the pet with mocked callbacks; returns the rename spy. */
-function renderPet(overrides: Partial<PetSpriteProps> = {}): { onRename: ReturnType<typeof vi.fn> } {
+/** Render the pet with mocked callbacks; returns the rename and open spys. */
+function renderPet(overrides: Partial<PetSpriteProps> = {}): {
+  onRename: ReturnType<typeof vi.fn>
+  onOpenSession: ReturnType<typeof vi.fn>
+} {
   const onRename = vi.fn()
+  const onOpenSession = vi.fn()
   const props: PetSpriteProps = {
     snapshot,
     definition: petDefinition(),
@@ -101,12 +107,13 @@ function renderPet(overrides: Partial<PetSpriteProps> = {}): { onRename: ReturnT
     onHide: vi.fn(),
     onDragEnd: vi.fn(),
     onRename,
+    onOpenSession,
     onFeedbackDone: vi.fn(),
     t,
     ...overrides,
   }
   render(<PetSprite {...props} />)
-  return { onRename }
+  return { onRename, onOpenSession }
 }
 
 /** Hover the sprite to open the panel, then click the rename button. */
@@ -171,6 +178,70 @@ describe('PetSprite rename input', () => {
     expect(onRename).not.toHaveBeenCalled()
     expect(screen.queryByPlaceholderText('输入新名字')).toBeNull()
   })
+
+  it('ignores Enter between compositionStart and compositionEnd even when isComposing is false (#303)', () => {
+    // WeChat IME (Windows) marks composition keydowns with isComposing ===
+    // false; only the explicit composition events can be trusted.
+    const { onRename } = renderPet()
+    const input = openRename()
+    fireEvent.change(input, { target: { value: '泡泡酱' } })
+    fireEvent.compositionStart(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onRename).not.toHaveBeenCalled()
+    expect(screen.getByPlaceholderText('输入新名字')).toBe(input)
+    fireEvent.compositionEnd(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onRename).toHaveBeenCalledWith('泡泡酱')
+  })
+
+  it("ignores 'Process' keydowns emitted by IMEs mid-composition (#303)", () => {
+    const { onRename } = renderPet()
+    const input = openRename()
+    fireEvent.change(input, { target: { value: '泡泡酱' } })
+    fireEvent.keyDown(input, { key: 'Process' })
+    expect(onRename).not.toHaveBeenCalled()
+    expect(screen.getByPlaceholderText('输入新名字')).toBe(input)
+  })
+
+  it('keeps the rename panel open when the pointer leaves mid-rename (#303)', () => {
+    // An IME candidate window is an OS-level window: moving the pointer onto
+    // it fires pointerleave on the float. The hide timer must not unmount
+    // the input mid-composition (that crashes some IMEs / the renderer).
+    vi.useFakeTimers()
+    try {
+      renderPet()
+      const input = openRename()
+      const float = input.parentElement?.parentElement?.parentElement
+      expect(float).not.toBeNull()
+      fireEvent.pointerOut(float!, { relatedTarget: null })
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(screen.getByPlaceholderText('输入新名字')).toBe(input)
+      // After the rename ends, hover behavior works again.
+      fireEvent.keyDown(input, { key: 'Escape' })
+      fireEvent.pointerOut(float!, { relatedTarget: null })
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(screen.queryByText('改名')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('PetSprite hover panel placement', () => {
+  it('places the panel above when an old saved position leaves no room below', () => {
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.style.bottom !== '') {
+        return { top: 720, right: 1256, bottom: 880, left: 1108, width: 148, height: 160, x: 1108, y: 720, toJSON: () => ({}) }
+      }
+      return { top: 888, right: 1259, bottom: 974, left: 1105, width: 154, height: 86, x: 1105, y: 888, toJSON: () => ({}) }
+    })
+
+    renderPet({ display: { ...snapshot.display, bottom: 20 } })
+    fireEvent.pointerOver(screen.getByRole('button', { name: '鲸鱼娘' }))
+
+    expect(screen.getByText('改名').closest('[data-placement]')?.getAttribute('data-placement')).toBe('above')
+  })
 })
 
 describe('PetSprite status bubble', () => {
@@ -194,6 +265,87 @@ describe('PetSprite status bubble', () => {
     expect(screen.queryByText('摸摸成功')).not.toBeNull()
     expect(screen.queryByText('正在思考')).toBeNull()
   })
+
+  it('renders one bubble per concurrent session without duplicating the global bubble', () => {
+    renderPet({
+      snapshot: {
+        ...workingSnapshot,
+        bubble: '正在思考',
+        sessions: [
+          { sessionId: 's-a', animation: 'running', phase: 'thinking', bubble: '正在思考' },
+          { sessionId: 's-b', animation: 'running-right', phase: 'tool', bubble: '正在使用 grep' },
+        ],
+      },
+    })
+    // The display session appears in the stack exactly once: the legacy
+    // single bubble is not rendered on top of the session list.
+    expect(screen.getAllByText('正在思考')).toHaveLength(1)
+    expect(screen.queryByText('正在使用 grep')).not.toBeNull()
+  })
+
+  it('lets feedback replace the whole session bubble stack', () => {
+    renderPet({
+      snapshot: {
+        ...workingSnapshot,
+        sessions: [
+          { sessionId: 's-a', animation: 'running', phase: 'thinking', bubble: '正在思考' },
+          { sessionId: 's-b', animation: 'running-right', phase: 'tool', bubble: '正在使用 grep' },
+        ],
+      },
+      feedback: { text: '摸摸成功', kind: 'pet', at: 1 },
+    })
+    expect(screen.queryByText('摸摸成功')).not.toBeNull()
+    expect(screen.queryByText('正在思考')).toBeNull()
+    expect(screen.queryByText('正在使用 grep')).toBeNull()
+  })
+
+  it('clicking a session bubble navigates to that session', () => {
+    const { onOpenSession } = renderPet({
+      snapshot: {
+        ...workingSnapshot,
+        bubble: '正在思考',
+        sessions: [
+          { sessionId: 's-a', animation: 'running', phase: 'thinking', bubble: '正在思考' },
+          { sessionId: 's-b', animation: 'running-right', phase: 'tool', bubble: '正在使用 grep' },
+        ],
+      },
+    })
+    fireEvent.click(screen.getByText('正在使用 grep'))
+    expect(onOpenSession).toHaveBeenCalledTimes(1)
+    expect(onOpenSession).toHaveBeenCalledWith('s-b')
+    fireEvent.click(screen.getByText('正在思考'))
+    expect(onOpenSession).toHaveBeenCalledTimes(2)
+    expect(onOpenSession).toHaveBeenCalledWith('s-a')
+    // Petting stays on the sprite only: bubble clicks must not pet.
+  })
+
+  it('clicking the legacy single bubble does not navigate (no session identity)', () => {
+    const { onOpenSession } = renderPet({ snapshot: workingSnapshot })
+    fireEvent.click(screen.getByText('正在思考'))
+    expect(onOpenSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps session bubbles visible and clickable while the hover panel is open', () => {
+    // Regression: the panel used to occupy the same region as the bubble
+    // stack and hide it on hover, so reaching a bubble was impossible. The
+    // panel now opens beside the sprite and the stack stays interactive.
+    const { onOpenSession } = renderPet({
+      snapshot: {
+        ...workingSnapshot,
+        sessions: [
+          { sessionId: 's-a', animation: 'running', phase: 'thinking', bubble: '正在思考' },
+          { sessionId: 's-b', animation: 'running-right', phase: 'tool', bubble: '正在使用 grep' },
+        ],
+      },
+    })
+    fireEvent.pointerOver(screen.getByRole('button', { name: '鲸鱼娘' }))
+    // The hover panel is open...
+    expect(screen.queryByText('改名')).not.toBeNull()
+    // ...and the bubbles are still there, still clickable.
+    expect(screen.getByText('正在使用 grep')).not.toBeNull()
+    fireEvent.click(screen.getByText('正在使用 grep'))
+    expect(onOpenSession).toHaveBeenCalledWith('s-b')
+  })
 })
 
 describe('PetSprite definition-driven render', () => {
@@ -206,5 +358,37 @@ describe('PetSprite definition-driven render', () => {
     renderPet()
     fireEvent.pointerOver(screen.getByRole('button', { name: '鲸鱼娘' }))
     expect(screen.queryByText('泡泡')).not.toBeNull()
+  })
+
+  it('advances a configured scene sequence after the current track duration', () => {
+    vi.spyOn(window, 'matchMedia').mockReturnValue({
+      matches: false,
+      media: '(prefers-reduced-motion: reduce)',
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    let nextFrame: FrameRequestCallback | undefined
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      nextFrame = callback
+      return 1
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    const definition = petDefinition()
+    definition.sequences = {
+      thinking: ['running', 'waiting', 'running', 'waiting', 'running'],
+    }
+    renderPet({
+      definition,
+      snapshot: { ...snapshot, animation: 'running', phase: 'thinking' },
+    })
+    const sprite = screen.getByRole('button', { name: '鲸鱼娘' })
+    expect(sprite.style.backgroundPosition).toBe('0px -1120px')
+    act(() => { nextFrame?.(1_500) })
+    expect(sprite.style.backgroundPosition).toBe('0px -960px')
   })
 })

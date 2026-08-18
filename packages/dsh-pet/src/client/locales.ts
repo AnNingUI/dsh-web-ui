@@ -19,7 +19,8 @@ export const zh = {
   'pet.treats': '小鱼干 ×{n}',
   'pet.state.loading': '宠物正在赶来…',
   'pet.state.error': '宠物迷路了（连接失败）',
-  // 插件设置卡片（settings.plugin.item 席位）。
+  'pet.openSessionHint': '点击跳转到对应会话',
+  // 一级设置页（settings.section 席位）。
   'settings.title': '宠物',
   'settings.description': '选择宠物并调整它的显示布局。',
   'settings.pet': '宠物',
@@ -64,7 +65,8 @@ export const en = {
   'pet.treats': 'Treats ×{n}',
   'pet.state.loading': 'The pet is on its way…',
   'pet.state.error': 'The pet is lost (connection failed)',
-  // Plugin settings card (the `settings.plugin.item` seat).
+  'pet.openSessionHint': 'Click to jump to this session',
+  // First-level settings section (the `settings.section` seat).
   'settings.title': 'Pet',
   'settings.description': 'Pick a pet and tune its display layout.',
   'settings.pet': 'Pet',

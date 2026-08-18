@@ -5,6 +5,7 @@ import type {} from '@deepseek-ai/dsh-session-projection'
 import { resolveEstimatorConfig } from './estimator.ts'
 import type { EstimatorConfig } from './estimator.ts'
 import { createLiveTokenUsageProjectionDefinition } from './projection.ts'
+import { mountOnce } from './mount-once.ts'
 
 /** Services required by the host projection plugin. */
 export const inject = ['sessionProjections']
@@ -42,7 +43,9 @@ export const Config: z<Config> = z.object({
  * @param ctx - host plugin context carrying sessionProjections.
  * @param config - resolved plugin config (schema defaults applied by the loader).
  */
-export function apply(ctx: Context, config: Config = {}): void {
+export const apply = mountOnce('@linxin666/dsh-live-stats', applyImpl)
+
+function applyImpl(ctx: Context, config: Config = {}): void {
   // The authoritative estimation source: the settings scope once the web
   // settings surface serves the namespace, the composition entry otherwise
   // (installSettingsSection swaps it on attach and detach).
@@ -50,17 +53,32 @@ export function apply(ctx: Context, config: Config = {}): void {
   let disposeProjection: (() => void) | undefined
 
   const rebuild = (): void => {
+    if ((current().enabled ?? true) === false) {
+      if (disposeProjection !== undefined) {
+        disposeProjection()
+        disposeProjection = undefined
+      }
+      return
+    }
+    const source = current()
+    // Validate the new spec BEFORE tearing down the old projection: a bad
+    // hand-edit (Infinity slips the schema's min gate) must not take the
+    // live estimate down with it.
+    let spec: ReturnType<typeof resolveEstimatorConfig>
+    try {
+      spec = resolveEstimatorConfig({
+        ...(source.charsPerToken === undefined ? {} : { charsPerToken: source.charsPerToken }),
+        ...(source.blockOverhead === undefined ? {} : { blockOverhead: source.blockOverhead }),
+        ...(source.roleOverhead === undefined ? {} : { roleOverhead: source.roleOverhead }),
+      })
+    } catch (error) {
+      console.error('[dsh-live-stats] invalid estimator spec, keeping the previous projection:', error)
+      return
+    }
     if (disposeProjection !== undefined) {
       disposeProjection()
       disposeProjection = undefined
     }
-    if ((current().enabled ?? true) === false) return
-    const source = current()
-    const spec = resolveEstimatorConfig({
-      ...(source.charsPerToken === undefined ? {} : { charsPerToken: source.charsPerToken }),
-      ...(source.blockOverhead === undefined ? {} : { blockOverhead: source.blockOverhead }),
-      ...(source.roleOverhead === undefined ? {} : { roleOverhead: source.roleOverhead }),
-    })
     disposeProjection = ctx.sessionProjections.register(createLiveTokenUsageProjectionDefinition(spec))
   }
 

@@ -8,13 +8,18 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createReadStream } from 'node:fs'
+import { dirname, win32 } from 'node:path'
 import { pipeline } from 'node:stream/promises'
+import { readFile, stat } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import type { PanelEnvelope, PanelError } from '../core/types.ts'
 import type { FsService } from './fs-service.ts'
 import type { GitService } from './git-service.ts'
 import { PollGuard } from './poll-guard.ts'
+import { isPanelAllowed } from './access.ts'
 
 const OK = (value: unknown): PanelEnvelope<unknown> => ({ ok: true, value })
 const FAIL = (error: PanelError): PanelEnvelope<never> => ({ ok: false, error })
@@ -22,11 +27,79 @@ const FAIL = (error: PanelError): PanelEnvelope<never> => ({ ok: false, error })
 /** Structural request failure (never a workspace fault). */
 const BAD_REQUEST: PanelError = { code: 'internal', message: 'malformed request' }
 
+/**
+ * Platform argv for "reveal in file manager" (select the entry). Windows
+ * Explorer selects via /select,; macOS Finder via open -R; Linux desktops
+ * have no select mode, so xdg-open opens the parent directory.
+ */
+export function revealArgv(platform: NodeJS.Platform, abs: string): string[] {
+  if (platform === 'win32') return ['explorer.exe', `/select,${abs}`]
+  if (platform === 'darwin') return ['open', '-R', abs]
+  return ['xdg-open', dirname(abs)]
+}
+
+/** Platform argv for "open with the default app". */
+export function openArgv(platform: NodeJS.Platform, abs: string): string[] {
+  if (platform === 'win32') return ['cmd.exe', '/c', 'start', '', abs]
+  if (platform === 'darwin') return ['open', abs]
+  return ['xdg-open', abs]
+}
+
+/**
+ * Spawn one OS GUI command fire-and-forget: Explorer / Finder / xdg-open
+ * detach immediately and their exit codes are not meaningful, so nothing is
+ * awaited beyond the spawn itself (failures still surface as an error).
+ */
+function spawnOsCommand(ctx: Context, argv: string[]): PanelError | null {
+  const spec: SubprocessSpawnSpec = {
+    argv,
+    cwd: spawnCwd(argv, process.platform),
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: 1 << 16 },
+      stderr: { maxBytes: 1 << 16 },
+    },
+    graceMs: 5_000,
+  }
+  try {
+    const handle = ctx.subprocess.spawn(spec)
+    void handle.done.catch((error) => {
+      // Async spawn failures (e.g. a bad cwd) surface here, not in the
+      // synchronous throw; log them so a dead GUI command is not silent.
+      ctx.logger.warn(`dsh-aionui-panel: OS command failed asynchronously ([${argv.join(', ')}]): ${String(error)}`)
+    })
+    return null
+  } catch (error) {
+    ctx.logger.warn(`dsh-aionui-panel: OS command failed ([${argv.join(', ')}]): ${String(error)}`)
+    return { code: 'internal', message: 'cannot run OS command' }
+  }
+}
+
+/**
+ * Working directory for an OS GUI command. The Windows reveal argv carries a
+ * `/select,` prefix on the path argument, so the raw last argv is not a real
+ * path; strip the prefix before taking its dirname, otherwise `spawn` fails
+ * with ENOENT because the cwd does not exist. Other platforms pass a real
+ * path (or the parent directory) as the last argument. Windows paths use
+ * win32 semantics even under a POSIX test runner — the argv builders are
+ * platform-keyed, so the dirname flavor must follow the target platform, not
+ * the host OS.
+ */
+export function spawnCwd(argv: string[], platform: NodeJS.Platform = process.platform): string {
+  let last = argv[argv.length - 1] ?? process.cwd()
+  if (last.startsWith('/select,')) last = last.slice('/select,'.length)
+  return platform === 'win32' ? win32.dirname(last) : dirname(last)
+}
+
 /** One SSE subscriber: a root and its last pushed git signature. */
 interface Subscriber {
   root: string
   lastGit: string
   res: ServerResponse
+  /** Set when the client disconnects; guards against late fs/git/heartbeat writes. */
+  closed: boolean
+  /** Cancels the current status process tree when this subscriber goes away. */
+  statusAbort?: AbortController
 }
 
 /**
@@ -41,12 +114,14 @@ const GIT_POLL_MS = 30_000
 const HEARTBEAT_MS = 15_000
 
 /**
- * Parse a single-range `bytes=start-end` header against the file size.
- * Returns null when no range was requested, 'invalid' for malformed or
- * unsatisfiable ranges (the caller answers 416), or the clamped start/end
- * (inclusive). Multi-range requests are treated as invalid — the panel only
- * ever serves single ranges. Suffix ranges (`bytes=-N`) select the last N
- * bytes. Range support added after human review on #242 (pdf seeking).
+ * Parse a `Range: bytes=start-end` header against the file size. RFC 7233
+ * lets a server ignore any Range it does not support, so unknown units,
+ * malformed headers and multi-range requests all return null (the caller
+ * answers 200 with the full body); only a syntactically valid single range
+ * that cannot be satisfied returns 'invalid' (the caller answers 416).
+ * Suffix ranges (`bytes=-N`) select the last N bytes. Range support added
+ * after human review on #242 (pdf seeking); ignore-instead-of-416 for
+ * unsupported shapes per maintainer feedback.
  */
 export function parseRangeHeader(
   header: string | undefined,
@@ -54,7 +129,7 @@ export function parseRangeHeader(
 ): { start: number; end: number } | 'invalid' | null {
   if (header === undefined) return null
   const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
-  if (match === null || (match[1] === '' && match[2] === '')) return 'invalid'
+  if (match === null || (match[1] === '' && match[2] === '')) return null
   if (match[1] === '') {
     const suffix = Number(match[2])
     if (suffix <= 0 || size === 0) return 'invalid'
@@ -66,15 +141,52 @@ export function parseRangeHeader(
   return { start, end }
 }
 
+/** Strip the weak prefix and quotes so entity-tags compare by opaque value. */
+function normalizeEtag(value: string): string {
+  return value.trim().replace(/^W\//, '').replace(/^"|"$/g, '')
+}
+
 /**
- * Deadline for one git-status subprocess inside pollGit. Not an execution
- * timeout — the subprocess' own graceMs limits a single binary run; this is
- * the route layer's guard against a hung status (e.g. a wedged git daemon on
- * a cold path) that would otherwise leave the anti-overlap guard (owned by
- * PollGuard) wedged forever and silence SCM. Owned here so the deadline is independent
- * of any service-level setting.
+ * Whether an If-None-Match header matches the current etag. Handles `*` and
+ * comma-separated entity-tag lists; GET revalidation uses weak comparison
+ * (RFC 9110), so the weak prefix is ignored on both sides.
+ */
+export function ifNoneMatchSaidFresh(header: string | undefined, etag: string): boolean {
+  if (header === undefined) return false
+  const current = normalizeEtag(etag)
+  return header.split(',').some((candidate) => {
+    const tag = candidate.trim()
+    return tag === '*' || normalizeEtag(tag) === current
+  })
+}
+
+/**
+ * Deadline for one status request. The timer aborts every subprocess spawned
+ * for that request; service-level single-flight keeps a failed termination
+ * from turning later poll ticks into additional live process trees.
  */
 const GIT_STATUS_TIMEOUT_MS = 15_000
+const GIT_STATUS_TIMEOUT_MESSAGE = 'git status timed out'
+
+/** Run one status operation under a deadline that also aborts its process tree. */
+export async function runGitStatusWithTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  controller: AbortController = new AbortController(),
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error(GIT_STATUS_TIMEOUT_MESSAGE)
+      controller.abort(error)
+      reject(error)
+    }, GIT_STATUS_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([run(controller.signal), deadline])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
 
 /**
  * PollGuard loop bounds. The poll is stopped by the SSE subscriber lifecycle
@@ -86,36 +198,6 @@ const GIT_STATUS_TIMEOUT_MS = 15_000
  */
 const GIT_POLL_DEADLINE_MS = Number.MAX_SAFE_INTEGER
 const GIT_POLL_MAX_BACKOFF_MS = GIT_POLL_MS
-
-/**
- * Loopback trust fence — the same judgment dsh-ssh applies to its host
- * routes: a loopback socket address AND a loopback Host header, plus browser
- * same-origin markers. The /aionui-panel operations read/write real workspace
- * files and run git, so a LAN-exposed dsh web must not serve them to unpaired
- * devices. The socket address is authoritative; X-Forwarded-For is never
- * trusted (matching dsh-ssh).
- */
-function isLoopbackRequest(request: IncomingMessage): boolean {
-  const address = request.socket.remoteAddress
-  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
-  const host = request.headers.host
-  if (typeof host !== 'string') return false
-  let hostUrl: URL
-  try {
-    hostUrl = new URL(`http://${host}`)
-  } catch {
-    return false
-  }
-  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') return false
-  if (request.headers['sec-fetch-site'] === 'cross-site') return false
-  const origin = request.headers.origin
-  if (origin === undefined) return true
-  try {
-    return new URL(origin).host === hostUrl.host
-  } catch {
-    return false
-  }
-}
 
 /** Write the shared non-loopback rejection (same body as dsh-ssh). */
 function forbidden(res: ServerResponse): void {
@@ -188,13 +270,42 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   // setInterval so polling stays alive while any stream is connected.
   let gitPoll: PollGuard | undefined
   let heartbeatTimer: NodeJS.Timeout | undefined
+  let gitProbeAbort: AbortController | undefined
+
+  const removeSubscriber = (subscriber: Subscriber): void => {
+    subscriber.closed = true
+    subscriber.statusAbort?.abort(new Error('git status cancelled'))
+    subscriber.statusAbort = undefined
+    subscribers.delete(subscriber)
+    if (subscribers.size === 0) {
+      stopGitPoll()
+      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
+      heartbeatTimer = undefined
+    }
+  }
+
+  const sseWrite = (subscriber: Subscriber, chunk: string): boolean => {
+    if (subscriber.closed) return false
+    const { res } = subscriber
+    if (res.writableEnded || res.destroyed) {
+      removeSubscriber(subscriber)
+      return false
+    }
+    try {
+      res.write(chunk)
+      return true
+    } catch {
+      removeSubscriber(subscriber)
+      return false
+    }
+  }
 
   const push = (subscriber: Subscriber, payload: unknown): void => {
-    subscriber.res.write(`event: change\ndata: ${JSON.stringify(payload)}\n\n`)
+    sseWrite(subscriber, `event: change\ndata: ${JSON.stringify(payload)}\n\n`)
   }
 
   // One-shot availability state: a machine without a git binary must not
-  // re-spawn ENOENT every 2s tick. The probe result is cached inside the git
+  // re-spawn ENOENT every poll tick. The probe result is cached inside the git
   // service, so this runs once, logs at most once, and then git polling stops
   // for the rest of this route instance while fs watching keeps working.
   let gitProbed = false
@@ -203,37 +314,46 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   // a tick that arrives mid-run is dropped), replacing the old `polling` bool.
   const pollGit = async (): Promise<void> => {
     if (!gitProbed) {
-      gitProbed = true
-      if (!(await git.gitAvailable())) {
-        gitUnavailable = true
-        ctx.logger.warn('dsh-aionui-panel: git binary unavailable, SCM polling disabled')
-        for (const subscriber of subscribers) push(subscriber, { kind: 'gitUnavailable' })
+      const controller = new AbortController()
+      gitProbeAbort = controller
+      try {
+        const available = await runGitStatusWithTimeout((signal) => git.gitAvailable(signal), controller)
+        gitProbed = true
+        if (!available) {
+          gitUnavailable = true
+          ctx.logger.warn('dsh-aionui-panel: git binary unavailable, SCM polling disabled')
+          for (const subscriber of subscribers) push(subscriber, { kind: 'gitUnavailable' })
+        }
+      } catch (error: unknown) {
+        ctx.logger.warn('dsh-aionui-panel: git availability probe failed: ' + String(error))
+        return
+      } finally {
+        if (gitProbeAbort === controller) gitProbeAbort = undefined
       }
     }
     if (gitUnavailable) return
     await Promise.all([...subscribers].map(async (subscriber) => {
+      const controller = new AbortController()
+      subscriber.statusAbort = controller
       try {
-        // Subscribers were gated when the stream opened, so use the
-        // canonical git methods (no double gate per 2s tick). repoOf inside
-        // them re-runs `rev-parse --show-toplevel` only after its TTL
-        // expires: a non-repo root never spawns a git status, and a repo
-        // created or removed while the host is running (git init / deleting
-        // .git) is still discovered by a later tick. The poll interval
-        // therefore keeps running while any subscriber is connected.
-        if (!(await git.isRepositoryCanonical(subscriber.root))) return
-        const status = await Promise.race([
-          git.statusCanonical(subscriber.root),
-          new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error('git status timed out')), GIT_STATUS_TIMEOUT_MS)
-          }),
-        ])
+        // The deadline covers repo discovery and the status scan. Its signal
+        // reaches every spawned git child, while GitService keeps the
+        // underlying scan single-flight until that child really settles.
+        const status = await runGitStatusWithTimeout(async (signal) => {
+          if (!(await git.isRepositoryCanonical(subscriber.root, signal))) return null
+          return git.statusCanonical(subscriber.root, signal)
+        }, controller)
         if (status === null) return
         const key = `${status.branch}|${JSON.stringify(status.staged)}|${JSON.stringify(status.unstaged)}|${JSON.stringify(status.untracked)}`
         if (key === subscriber.lastGit) return
         subscriber.lastGit = key
         push(subscriber, { kind: 'git', status })
       } catch (error: unknown) {
-        ctx.logger.warn(`dsh-aionui-panel: git poll failed for ${subscriber.root}: ${String(error)}`)
+        if (!subscriber.closed) {
+          ctx.logger.warn(`dsh-aionui-panel: git poll failed for ${subscriber.root}: ${String(error)}`)
+        }
+      } finally {
+        if (subscriber.statusAbort === controller) subscriber.statusAbort = undefined
       }
     }))
   }
@@ -249,6 +369,8 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
     gitPoll.start()
   }
   const stopGitPoll = (): void => {
+    gitProbeAbort?.abort(new Error('git status cancelled'))
+    gitProbeAbort = undefined
     if (gitPoll === undefined) return
     gitPoll.stop()
     gitPoll = undefined
@@ -260,8 +382,9 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
    * resolves and stats the path, the bytes are piped straight from disk with
    * the derived mime — the whole file never sits in host memory. Single byte
    * ranges are honored (206/416) so the browser pdf viewer can seek large
-   * files. No validators are negotiated, so the browser revalidates every
-   * time — a re-edited file never shows stale bytes.
+   * files; unsupported range shapes are ignored per RFC 7233 (200 full
+   * body). ETag/Last-Modified (size+mtime) keep no-cache revalidation cheap:
+   * unchanged files answer 304, If-Range mismatches fall back to 200.
    */
   const serveRaw = async (req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> => {
     const root = url.searchParams.get('root')
@@ -276,18 +399,36 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
       json(res, FAIL(result), status)
       return
     }
-    const range = parseRangeHeader(req.headers.range, result.size)
-    if (range === 'invalid') {
-      res.writeHead(416, { 'content-range': `bytes */${result.size}` })
-      res.end()
-      return
-    }
-    const headers: Record<string, string | number> = {
+    // Validators from size+mtime: no-cache forces revalidation, and a match
+    // answers 304 instead of re-streaming — scrolling a large pdf issues many
+    // range requests, so they must be cheap (maintainer feedback on #242).
+    const etag = `W/"${result.size}-${Math.floor(result.mtime)}"`
+    const lastModified = new Date(result.mtime).toUTCString()
+    const baseHeaders: Record<string, string | number> = {
       'content-type': result.mime,
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
       'accept-ranges': 'bytes',
+      etag,
+      'last-modified': lastModified,
     }
+    if (ifNoneMatchSaidFresh(req.headers['if-none-match'], etag) && req.headers.range === undefined) {
+      res.writeHead(304, baseHeaders)
+      res.end()
+      return
+    }
+    // If-Range guards a range against a changed file: a mismatch falls back
+    // to the full 200 body rather than serving a stale slice.
+    const ifRange = req.headers['if-range']
+    const range = ifRange !== undefined && ifRange !== etag && ifRange !== lastModified
+      ? null
+      : parseRangeHeader(req.headers.range, result.size)
+    if (range === 'invalid') {
+      res.writeHead(416, { ...baseHeaders, 'content-range': `bytes */${result.size}` })
+      res.end()
+      return
+    }
+    const headers: Record<string, string | number> = { ...baseHeaders }
     if (range === null) {
       headers['content-length'] = result.size
       res.writeHead(200, headers)
@@ -305,10 +446,58 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
     }
   }
 
+  /**
+   * GET /aionui-panel/vendor/mermaid.js: the mermaid IIFE bundle shipped in
+   * the package (lib/assets/mermaid.min.js, copied from the mermaid npm
+   * dependency at build time). Same-origin for the browser half (no CDN),
+   * loopback-fenced like every other route. One read is cached per plugin
+   * instance; the size+mtime pair doubles as the ETag so the browser
+   * revalidation is a cheap 304. A missing asset (build without the copy
+   * step) 404s and the client keeps plain code blocks.
+   */
+  let mermaidAsset: { data: Buffer; etag: string } | undefined
+  const serveVendorMermaid = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (mermaidAsset === undefined) {
+      // Candidate layouts: the built lib half (lib/index.js -> lib/assets/)
+      // and the source tree (src/host/routes.ts -> lib/assets), so tests
+      // running against src serve the same build-copied asset.
+      const candidates = ['./assets/mermaid.min.js', '../../lib/assets/mermaid.min.js']
+      for (const relative of candidates) {
+        try {
+          const assetPath = fileURLToPath(new URL(relative, import.meta.url))
+          const [data, info] = await Promise.all([readFile(assetPath), stat(assetPath)])
+          mermaidAsset = { data, etag: `"${data.length}-${info.mtimeMs.toString(16)}"` }
+          break
+        } catch {
+          // try the next layout
+        }
+      }
+      if (mermaidAsset === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: 'mermaid vendor asset missing' }))
+        return
+      }
+    }
+    if (req.headers['if-none-match'] === mermaidAsset.etag) {
+      res.writeHead(304, { etag: mermaidAsset.etag })
+      res.end()
+      return
+    }
+    res.writeHead(200, {
+      'content-type': 'application/javascript; charset=utf-8',
+      'content-length': mermaidAsset.data.length,
+      'cache-control': 'no-cache',
+      etag: mermaidAsset.etag,
+      'x-content-type-options': 'nosniff',
+    })
+    res.end(mermaidAsset.data)
+  }
+
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    // Loopback fence first: never let a LAN client reach any /aionui-panel
-    // operation, regardless of method or content-type.
-    if (!isLoopbackRequest(req)) {
+    // Trust fence first: never let an unpaired non-loopback client reach any
+    // /aionui-panel operation, regardless of method or content-type. A live
+    // paired-device cookie (when remote-web-ui is loaded) is an allow path.
+    if (!isPanelAllowed(ctx, req)) {
       forbidden(res)
       return
     }
@@ -316,6 +505,10 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
       const url = new URL(req.url ?? '/', 'http://x')
       if (url.pathname === '/aionui-panel/raw') {
         await serveRaw(req, url, res)
+        return
+      }
+      if (url.pathname === '/aionui-panel/vendor/mermaid.js') {
+        await serveVendorMermaid(req, res)
         return
       }
       res.writeHead(405)
@@ -397,9 +590,75 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
         json(res, 'ok' in result ? OK(result) : FAIL(result))
         return
       }
+      case '/aionui-panel/reveal': {
+        const path = strField(payload, 'path')
+        if (path === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const resolved = await fs.resolveAbsolute(root, path)
+        if (!('ok' in resolved)) {
+          json(res, FAIL(resolved))
+          return
+        }
+        const error = spawnOsCommand(ctx, revealArgv(process.platform, resolved.abs))
+        json(res, error === null ? OK({ ok: true as const }) : FAIL(error))
+        return
+      }
+      case '/aionui-panel/open-with-default': {
+        const path = strField(payload, 'path')
+        if (path === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const resolved = await fs.resolveAbsolute(root, path)
+        if (!('ok' in resolved)) {
+          json(res, FAIL(resolved))
+          return
+        }
+        const error = spawnOsCommand(ctx, openArgv(process.platform, resolved.abs))
+        json(res, error === null ? OK({ ok: true as const }) : FAIL(error))
+        return
+      }
+      case '/aionui-panel/rename': {
+        const path = strField(payload, 'path')
+        const newName = strField(payload, 'newName')
+        if (path === null || newName === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const result = await fs.rename(root, path, newName)
+        json(res, 'ok' in result ? OK(result) : FAIL(result))
+        return
+      }
+      case '/aionui-panel/mkdir': {
+        const path = strField(payload, 'path')
+        if (path === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const result = await fs.mkdir(root, path)
+        json(res, 'ok' in result ? OK(result) : FAIL(result))
+        return
+      }
+      case '/aionui-panel/new-file': {
+        const path = strField(payload, 'path')
+        if (path === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const result = await fs.newFile(root, path)
+        json(res, 'ok' in result ? OK(result) : FAIL(result))
+        return
+      }
       case '/aionui-panel/git-status': {
-        const result = await git.status(root)
-        json(res, result === null ? OK(null) : 'root' in result ? OK(result) : FAIL(result))
+        try {
+          const result = await runGitStatusWithTimeout((signal) => git.status(root, signal))
+          json(res, result === null ? OK(null) : 'root' in result ? OK(result) : FAIL(result))
+        } catch (error: unknown) {
+          ctx.logger.warn(`dsh-aionui-panel: git status failed for ${root}: ${String(error)}`)
+          json(res, FAIL({ code: 'internal', message: GIT_STATUS_TIMEOUT_MESSAGE }))
+        }
         return
       }
       case '/aionui-panel/git-diff': {
@@ -452,9 +711,10 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   }
 
   const sse = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    // Reject non-loopback clients before gating the root or opening the
-    // stream: a LAN-exposed deployment must not offer a subscription at all.
-    if (!isLoopbackRequest(req)) {
+    // Reject unpaired non-loopback clients before gating the root or opening
+    // the stream: a LAN-exposed deployment must not offer a subscription at
+    // all, unless the caller already passed pairing.
+    if (!isPanelAllowed(ctx, req)) {
       forbidden(res)
       return
     }
@@ -479,7 +739,7 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
       connection: 'keep-alive',
     })
     res.write('retry: 2000\n\n')
-    const subscriber: Subscriber = { root: gated.canonical, lastGit: '', res }
+    const subscriber: Subscriber = { root: gated.canonical, lastGit: '', res, closed: false }
     subscribers.add(subscriber)
     // A stream opened after the one-shot probe already failed gets the
     // unavailable event right away; streams open during the probe receive it
@@ -488,20 +748,19 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
     startGitPoll()
     if (heartbeatTimer === undefined) {
       heartbeatTimer = setInterval(() => {
-        for (const current of subscribers) current.res.write(': ping\n\n')
+        for (const current of [...subscribers]) sseWrite(current, ': ping\n\n')
       }, HEARTBEAT_MS)
     }
     const disposeWatch = fs.watch(gated.canonical, () => {
       push(subscriber, { kind: 'fs' })
     })
+    res.on('error', () => {
+      disposeWatch()
+      removeSubscriber(subscriber)
+    })
     req.on('close', () => {
       disposeWatch()
-      subscribers.delete(subscriber)
-      if (subscribers.size === 0) {
-        stopGitPoll()
-        if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
-        heartbeatTimer = undefined
-      }
+      removeSubscriber(subscriber)
     })
   }
 
@@ -513,7 +772,11 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
     for (const dispose of disposers) dispose()
     stopGitPoll()
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
-    for (const subscriber of subscribers) subscriber.res.end()
+    for (const subscriber of subscribers) {
+      subscriber.closed = true
+      subscriber.statusAbort?.abort(new Error('git status cancelled'))
+      subscriber.res.end()
+    }
     subscribers.clear()
   }
 }
